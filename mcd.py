@@ -1,1717 +1,1330 @@
-# Be sure to use Python 3.5-3.7 after installing pyswarms and pyyaml 
-# e.g. install with: python3.6 -m pip install pyswarms, pyyaml 
-import numpy as np 
-from scipy.linalg import eig, svd, inv, pinv 
-from scipy.special.orthogonal import p_roots 
-from scipy.optimize import curve_fit 
-from yaml import safe_load 
-import sys, os, csv, time 
-import pyswarms as ps 
+import numpy as np
+from yaml import safe_load
+from scipy.linalg import block_diag
+from time import time
+import sys
+import csv
+import pyswarms as ps
+from utilities import *
+from hamiltonian import SpinSystem, IntegrationGrid, integrate
 
-# some initial useful constants, etc. 
-zeemanFactor = 0.4668644735835207  # Bohr magneton in units of cm-1/Tesla 
-boltzFactor = -1.4387768775039338  # -1/kB in units of Kelvin/cm-1
-htFactor = 0.33585690476000785     # (Bohr mag)/(2kB) in units of Kelvin/Tesla 
-gen_pol_mat = [['M'+str(i+1)] for i in range(3)] 
-three_pol_mat = [['Myz'], ['Mzx'], ['Mxy']] 
-numeric = (int, float, np.int16, np.int32, np.int64, np.uint16, np.uint32, 
-           np.uint64, np.float16, np.float32, np.float64) 
 
-""" express_duration """ 
-def express_duration(start_time): 
-  now = time.time() 
-  diff = now-start_time 
-  out = "" 
-  if diff >= 86400: 
-    out += str(int(diff//86400))+" days " 
-    diff = diff % 86400 
-  if diff >= 3600: 
-    out += str(int(diff//3600))+" h " 
-    diff = diff % 3600 
-  if diff >= 60: 
-    out += str(int(diff//60))+" min " 
-    diff = diff % 60 
-  out += ('%.3f'%diff)+" sec" 
-  print('\nJob successfully completed in', out, flush=True) 
+def reduce_dimension(mat, weight, yvals, cutoff):
+    if cutoff == 0 or cutoff >= 1:
+        return mat, np.eye(mat.shape[1])
+    else:
+        n = len(mat)
+        u, s, vt = np.linalg.svd(mat, full_matrices=False)
+        us = u @ np.diag(s)
+        if cutoff > 0:
+            # if any singular values are noisily small, we'll clip; min 1
+            dims = max(sum(int(i > cutoff) for i in (s / max(s))), 1)
+            reduced_chi_sq = [np.inf]
+            for p in range(1, dims + 1):
+                us = u[:, :p] @ np.diag(s[:p])
+                params = us.T * weight
+                params = np.linalg.pinv(params @ us) @ (params @ yvals)
+                residuals = us @ params - yvals
+                reduced_chi_sq.append((residuals * weight) @ residuals / (n - p))
+            dims = np.argmin(reduced_chi_sq)  # get dimensionality with smallest reduced chi**2 value
+        else:
+            dims = max(int(abs(cutoff)), 1)
+        return us[:, :dims], vt[:dims]
 
-""" raise_error: Prints the requested string to the user as an error then quits 
-    by returning 1 (generic error code). """
-def raise_error(*args): 
-  print('ERROR:',*args) 
-  sys.exit(1) 
 
-""" sf: formats numbers using significant figures 
-    converts a number 'x' into a string with 'sig' significant figures and 
-    rounds anything less than 1e-10 in magnitude to zero """ 
-def sf(x, sig=6): 
-  if isinstance(x, (list, np.ndarray)): # if list 
-    return '[' + ', '.join([sf(n, sig) for n in x]) + ']' 
-  elif isinstance(x, numeric): # if valid number 
-    if np.isnan(x): # if NaN, return 'NaN' string 
-      return 'NaN' 
-    x = float(x) 
-  else: # if invalid 'x', use Python's default str() 
-    return str(x) 
-  if not isinstance(sig, int): # if invalid 'sig', use Python's default str()
-    return str(x) 
-  elif sig <= 0: 
-    return str(x) 
-  if abs(x) < 1e-10: # if -1e-10 < x < 1e-10, report as 0 
-    n = ''.zfill(sig) 
-    return n[:1]+'.'+n[1:] 
-  elif np.sign(x) < 0: # if 'x' is negative 
-    return '-'+sf(abs(x), sig) 
-  else: # x is positive and non-negligible, so we will format... 
-    q=int(np.floor(np.log10(x))) 
-    n = str(round(x*10**(sig-1-q))) # only keeping 'sig' sig figs 
-    if len(n) != sig: # if rounding changes # digits
-      x = round(x*10**(sig-1-q))
-      x = x*10**(q-sig+1) 
-      return sf(x, sig) 
-    # when to use engineering notation 
-    if q > 5 or q < -5: # <1e-5 or >=1e6 
-      n = sf(x*10**(-q), sig) 
-      if q > 0: 
-        n += 'e+'+str(q) 
-      else: 
-        n += 'e'+str(q) 
-      return n 
-    # otherwise 
-    else: 
-      if q+1 >= sig: 
-        n = n.ljust(q+1,'0') # add appropriate number of 0s if missing 
-      elif q >= 0 and q+1 < sig: 
-        n = n[:q+1]+'.'+n[q+1:] 
-      else: 
-        n = '0.'.ljust(1-q,'0') + n 
-      return n 
+class Simulation:
+    def __init__(self, fitted, simulations, params, transform):
+        self.fitted = fitted
+        self.simulations = simulations
+        self.parameters = params
+        self.transform = transform
 
-""" number_error: formats numbers with error 
-    Formats "3.04 +/- 0.02" as "3.04(2)" and handles a few exceptions """ 
-def number_error(x, s): 
-  if not isinstance(x, numeric) or not isinstance(s, numeric): 
-    return str(x) + ' +/- ' + str(s) 
-  if np.isnan(x): 
-    return 'NaN' 
-  elif np.isnan(s): 
-    return sf(x)+'(NaN)' 
-  if abs(x) < 1e-10: # round small x to zero 
-    x = 0 
-  if s < 1e-10: # small or negative error -> no error 
-    s = 0 
-  if s == 0: # without error, just show with default number of sig figs 
-    return sf(x) 
-  if x < 0: # if negative, add minus sign 
-    return '-'+number_error(abs(x), s) 
-  r = int(np.floor(np.log10(s))) # magnitude of s 
-  x = round(x*10**(-r))*10**(r) # round x as appropriate 
-  if abs(x) > 1e-10: # if still nonzero 
-    q = int(np.floor(np.log10(x))) # magnitude of x 
-  else: 
-    if r <= 5 and r >= 0: 
-      n = str(int(s*10**(-r))*10**(r)) # format error with zeros 
-      return '0('+n+')' 
-    elif r < 0 and r >= -5: 
-      m = ''.zfill(1-r) # show appropriate number of zeros 
-      m = m[:1]+'.'+m[1:] # add decimal point 
-      n = str(int(s*10**(-r))) # keep only first digit of 's' 
-      return m+'('+n+')' 
-    q = -12 # say x is very small 
-  # when to use engineering notation 
-  if max(q,r) > 5 or max(q,r) < -5: # <1e-5 or >=1e6 
-    m = str(round(x*10**(-r))) # keep sig figs of x up to 'r' 
-    n = str(int(s*10**(-r))) # keep only first digit of 's' 
-    n = '('+n+')' # add parentheses 
-    if q-r > 1: # if there's at least one more x sig fig than s 
-      m = m[:1]+'.'+m[1:] # add a decimal point 
-    m += n 
-    if max(q,r) > 0: 
-      m += 'e+'+str(max(q,r)) 
-    else: 
-      m += 'e'+str(max(q,r)) 
-    return m 
-  # if no engineering notation 
-  if r > 0: 
-    n = str(int(s*10**(-r))*10**(r)) # reformat with zeros 
-  else: 
-    n = str(int(s*10**(-r))) # keep only first digit of 's' 
-  return sf(x, q-r+1)+'('+n+')' 
+    @property
+    def adjustment(self):
+        return max(self.simulations.shape) / (max(self.simulations.shape) - min(self.simulations.shape))
 
-""" print_matrix_eq: print a matrix equation 
-    - accepts a list of matrices and non-matrix strings (e.g. '=') """ 
-def print_matrix_eq(*list_of_matrices, indent=6): 
-  formatted = []
-  for mat in list_of_matrices: 
-    if isinstance(mat, (list, np.ndarray)): 
-      mat = np.transpose(mat) 
-      formatted.append(['[']*len(mat[0])) 
-      for col in mat: 
-        formatted.append([sf(x) for x in col]) 
-        formatted.append([' ']*len(col)) 
-      formatted.pop() 
-      formatted.append([']']*len(mat[0])) 
-    elif isinstance(mat, str): 
-      formatted.append([mat]) 
-  nrows = max([len(x) for x in formatted]) 
-  list_of_matrices = list() 
-  for mat in formatted: 
-    x = [sf(y) for y in mat] 
-    x = x+['']*(nrows-len(x)) 
-    maxlen = max([len(y) for y in x]) 
-    x = [y+' '*(maxlen-len(y)) for y in x] 
-    list_of_matrices.append(x) 
-  list_of_matrices = list(map(list, zip(*list_of_matrices))) # transpose 
-  for row in list_of_matrices: 
-    print(' '*indent+''.join(row))
 
-""" IntegrationGrid class: contains a grid of points used for integration """ 
-class IntegrationGrid: 
-  def __init__(self, gridtype, deg, domain='auto'): 
-    self.grid = [] 
-    if gridtype is None: 
-      print('- Unspecified method; defaulting to Gaussian quadrature') 
-      gridtype = 'gaussian' 
-    if gridtype not in ['gaussian', 'lebedev', 'discrete']: 
-      raise_error('Unrecognized/unsupported integration method:',str(gridtype)) 
-    if domain not in ['auto', 'octant', 'quadrant', 'hemisphere', 'sphere']: 
-      raise_error('Unrecognized integration domain:', str(domain)) 
-    if gridtype == "gaussian": 
-      if not isinstance(deg, (list, int)): 
-        raise_error('Uninterpretable grid precision') 
-      if isinstance(deg, int): 
-        if deg == 0: deg = 5 
-        if deg < 3: raise_error('Minimum Gaussian precision is 3') 
-        deg = [deg] 
-      if len(deg) == 1: 
-        deg = [deg[0], deg[0]] 
-      elif len(deg) != 2: 
-        raise_error('Unusual list length in Gaussian grid:', str(deg)) 
-      [rx,wx] = p_roots(deg[0]) 
-      [ry,wy] = p_roots(deg[1]) 
-      for i in range(len(rx)): # i corresponds to theta (0..pi/2) 
-        theta = (np.pi/4.0)*(rx[i]+1.0) # adjust region from unit square 
-        ct = np.cos(theta) 
-        st = np.sin(theta) 
-        for j in range(len(ry)): # j correspond to phi (0..pi/2) 
-          phi = (np.pi/4.0)*(ry[j]+1.0) # adjust region from unit square 
-          cf = np.cos(phi) 
-          sf = np.sin(phi) 
-          if domain == 'auto' or domain == 'octant': 
-            self.grid.append([st*cf, st*sf, ct, st*wx[i]*wy[j]*(np.pi/8)]) 
-          elif domain == 'quadrant': 
-            self.grid.append([st*cf, st*sf, ct, st*wx[i]*wy[j]*(np.pi/16)]) 
-            self.grid.append([st*cf, st*sf, -ct, st*wx[i]*wy[j]*(np.pi/16)]) 
-          elif domain == 'hemisphere': 
-            self.grid.append([st*cf, st*sf, ct, st*wx[i]*wy[j]*(np.pi/32)]) 
-            self.grid.append([st*cf, st*sf, -ct, st*wx[i]*wy[j]*(np.pi/32)]) 
-            self.grid.append([st*cf, -st*sf, ct, st*wx[i]*wy[j]*(np.pi/32)]) 
-            self.grid.append([st*cf, -st*sf, -ct, st*wx[i]*wy[j]*(np.pi/32)]) 
-          elif domain == 'sphere': 
-            self.grid.append([st*cf, st*sf, ct, st*wx[i]*wy[j]*(np.pi/64)]) 
-            self.grid.append([st*cf, st*sf, -ct, st*wx[i]*wy[j]*(np.pi/64)]) 
-            self.grid.append([st*cf, -st*sf, ct, st*wx[i]*wy[j]*(np.pi/64)]) 
-            self.grid.append([-st*cf, st*sf, ct, st*wx[i]*wy[j]*(np.pi/64)]) 
-            self.grid.append([-st*cf, -st*sf, ct, st*wx[i]*wy[j]*(np.pi/64)]) 
-            self.grid.append([-st*cf, st*sf, -ct, st*wx[i]*wy[j]*(np.pi/64)]) 
-            self.grid.append([st*cf, -st*sf, -ct, st*wx[i]*wy[j]*(np.pi/64)]) 
-            self.grid.append([-st*cf, -st*sf, -ct, st*wx[i]*wy[j]*(np.pi/64)]) 
-      if domain == 'auto': domain = 'auto (octant)' 
-    elif gridtype == "lebedev": 
-      if domain not in ['auto', 'sphere']: 
-        raise_error('Lebedev grids only available over the entire sphere;', 
-                    domain, 'not supported.') 
-      if domain == 'auto': domain = 'auto (sphere)' 
-      supported = [3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31, 35, 
-                   41, 47, 53, 59, 65, 71, 77, 83, 89, 95, 101, 107, 113, 119, 
-                   125, 131] 
-      if not isinstance(deg, int): 
-        raise_error('Lebedev: Unusual Lebedev grid specification of '+str(deg)) 
-      elif deg not in supported: 
-        raise_error('Lebedev: Unrecognized Lebedev precision of '+str(deg)) 
-      if deg == 0: 
-        print('- Using minimum Lebedev precision of 3')
-        deg = 3 
-      # Now we need to locate the grid files... 
-      try: # First, check for an environment variable LEBEDEV 
-        leb_folder = os.environ['LEBEDEV'] 
-      except KeyError: # If unspecified, look for a 'lebedev' subdirectory 
-        leb_folder = 'lebedev' 
-      try: # Now we try to import the file 
-        leb = np.loadtxt(leb_folder+'/lebedev_%03d.txt'% deg) 
-      except OSError: # If file not found 
-        raise_error('Lebedev grid file lebedev_%03d.txt not found\n'% deg, 
-                    '       check LEBEDEV environment variable') 
-      rx = leb[:,1]*np.pi/180.0; ry = leb[:,0]*np.pi/180.0; w = leb[:,2] 
-      for i in range(len(w)): 
-        theta = rx[i]; phi = ry[i] 
-        ct = np.cos(theta) 
-        st = np.sin(theta) 
-        cf = np.cos(phi) 
-        sf = np.sin(phi) 
-        self.grid.append([st*cf, st*sf, ct, w[i]]) 
-    elif gridtype == "discrete": 
-      domain = 'auto' 
-      if not isinstance(deg, (list, str)): 
-        raise_error('Specify file or list discrete [theta,phi] in radians\n', 
-                    '       Error interpreting', str(deg)) 
-      if isinstance(deg, str): # if we're supplied with a file name 
-        pts = np.loadtxt(deg) # read grid from file; format: [phi,theta,w] 
-        rx = pts[:,1]*np.pi/180.0; ry = pts[:,0]*np.pi/180.0; w = pts[:,2] 
-        for i in range(len(w)): 
-          theta = rx[i]; phi = ry[i] 
-          ct = np.cos(theta) 
-          st = np.sin(theta) 
-          cf = np.cos(phi) 
-          sf = np.sin(phi) 
-          self.grid.append([st*cf, st*sf, ct, w[i]]) 
-      else: 
-        if len(deg) == 0: 
-          raise_error('Empty list of discrete orientations provided')
-        if len(deg) == 2: 
-          if all(isinstance(x, numeric) for x in deg): 
-            deg = [deg] 
-        num = len(deg) 
-        for i in deg: 
-          if not isinstance(x, list): 
-            raise_error('Discrete grid non-list error for', str(i), 
-                        'in', str(deg)) 
-          if len(x) != 2: 
-            raise_error('Discrete grid accepts two element lists, not', str(i), 
-                        'in', str(deg)) 
-          if not all(isinstance(j, numeric) for j in i): 
-            raise_error('Discrete grid type error for', str(i), 'in', str(deg)) 
-          [theta, phi] = i 
-          ct = np.cos(theta) 
-          st = np.sin(theta) 
-          cf = np.cos(phi) 
-          sf = np.sin(phi) 
-          self.grid.append([st*cf, st*sf, ct, 1.0/num]) 
-    self.size = len(self.grid) 
-    self.method = gridtype 
-    self.domain = domain 
-    self.deg = deg 
+class Dataset:
+    def __init__(self, input=None, output=None):
+        if input is None or isinstance(input, str):  # initialize `public` variables
+            self.tempfield = None
+            self.filename, self.header, self.output = input, 0, output
+            self._data, self._error, self.centers, self._num = np.array([]), np.array([]), [], 0
+            self._polarizations, self._constraints, self._b_term, self._weights = None, [], [], None
+            if input is not None:
+                self.read_file()
+        elif isinstance(input, Dataset):  # copy variables from supplied Dataset, if present
+            self.tempfield = np.array(input.tempfield)
+            self.filename = str(input.filename)
+            self.header = int(input.header)
+            self.output = output if output is not None else str(input.output)
+            self._data = np.array(input.data)
+            self._error = np.array(input.error)
+            self.centers = list(input.centers)
+            self._polarizations = list(input.polarizations)
+            self._constraints = list(input.constraints)
+            self._b_term = list(input.b_term)
+            self._weights = np.array(input._weights)
+        else:
+            raise TypeError(f'Expected `input` as a str or Dataset object not {type(input)}')
+        self.spin_system, self.integration_grid, self.cutoff = None, None, None
+        self.simulation = np.zeros(self.data.shape)  # DEBUG
+        self.wrss = np.zeros(self.data.shape[0])  # DEBUG
+        self.cartesian, self.svd_reduced, self.svd_transform, self.svd_polarizations = None, None, None, None
 
-""" zyzrotate: convert zyz Euler angles into a rotation matrix """ 
-def zyzrotate(alpha,beta,gamma): 
-  c1 = np.cos(alpha) 
-  s1 = np.sin(alpha) 
-  c2 = np.cos(beta) 
-  s2 = np.sin(beta) 
-  c3 = np.cos(gamma) 
-  s3 = np.sin(gamma) 
-  a11 =  c1*c2*c3-s1*s3 
-  a12 =  c1*s3+c2*c3*s1 
-  a13 = -c3*s2 
-  a21 = -c3*s1-c1*c2*s3 
-  a22 =  c1*c3-c2*s1*s3 
-  a23 =  s2*s3 
-  a31 =  c1*s2 
-  a32 =  s1*s2 
-  a33 =  c2 
-  return np.array([[a11,a12,a13],[a21,a22,a23],[a31,a32,a33]]) 
+    @property
+    def num(self):
+        self._num = max(len(self._data) if isinstance(self._data, (list, np.ndarray)) else 0,
+                        len(self.polarizations) if isinstance(self.polarizations, (list, np.ndarray)) else 0)
+        return self._num
 
-""" getgmat: construct 3x3 g value matrix from a 6-membered list 
-    [gx, gy, gz, alpha, beta, gamma] using zyz Euler angles """
-def getgmat(gvalueinfo): 
-  gx = gvalueinfo[0] 
-  gy = gvalueinfo[1] 
-  gz = gvalueinfo[2] 
-  alpha = gvalueinfo[3] 
-  beta  = gvalueinfo[4] 
-  gamma = gvalueinfo[5] 
-  rot = zyzrotate(alpha,beta,gamma) 
-  rotT = np.transpose(rot) 
-  g = [[gx,0,0],[0,gy,0],[0,0,gz]] 
-  g = np.dot(g,rotT) 
-  g = np.dot(rot,g) 
-  return np.array(g) 
+    @property
+    def data(self) -> np.ndarray:
+        return self._data
 
-""" getdmat: construct 3x3 ZFS matrix from a 5-membered list 
-    [D, E/D, alpha, beta, gamma] using zyz Euler angles """
-def getdmat(dvalueinfo): 
-  d   = dvalueinfo[0] 
-  eod = dvalueinfo[1] 
-  alpha = dvalueinfo[2] 
-  beta  = dvalueinfo[3] 
-  gamma = dvalueinfo[4] 
-  rot = zyzrotate(alpha,beta,gamma) 
-  rotT = np.transpose(rot) 
-  dmat = [[(-1/3.0)*d+eod*d,0,0],[0,(-1/3.0)*d-eod*d,0],[0,0,(2/3.0)*d]] 
-  dmat = np.dot(dmat,rotT) 
-  dmat = np.dot(rot,dmat) 
-  return np.array(dmat) 
+    @data.setter
+    def data(self, data_array: (list, np.ndarray)):
+        self._data = np.array(data_array)
+        self.wrss = np.zeros(self._data.shape[0])
+        if not isinstance(self.centers, (list, np.ndarray)):
+            self.centers = [0] * self.num
+        elif len(self.centers) < self.num:
+            self.centers.extend([0] * (self.num - len(self.centers)))
+        if not isinstance(self._b_term, list):
+            self._b_term = [None] * self.num
+        elif len(self._b_term) < self.num:
+            self._b_term.extend([None] * (self.num - len(self._b_term)))
+        if not isinstance(self._constraints, (list, np.ndarray)):
+            self._constraints = [None] * self.num
+        elif len(self._constraints) < self._data.shape[0]:
+            self._constraints.extend([None] * (self.num - len(self._constraints)))
+        if not isinstance(self._error, np.ndarray):
+            self._error = np.zeros(self._data.shape)
+        if self._error.shape != self._data.shape:
+            self._error = np.zeros(self._data.shape)
+            self._error = self._error[:self._data.shape[0], :self._data.shape[1]]
+            padding = ((0, self._data.shape[0] - self._error.shape[0]), (0, self._data.shape[1] - self._error.shape[1]))
+            self._error = np.pad(self._error, padding)
+        self.simulation = np.zeros((self.num, len(self.tempfield)))
 
-""" resolve_variables: converts from supplied variable values to usable 
-    magnetic parameters """ 
-def resolve_variables(x_vals, x_vars, vars): 
-  x_out = [] 
-  for i in range(len(x_vals)): 
-    if isinstance(x_vals[i], list): # if it's a list 
-      x_out.append(resolve_variables(x_vals[i], x_vars[i], vars)) 
-    elif isinstance(x_vals[i], str): # if it's a variable name  
-      x_out.append(vars[x_vars[i]]) 
-    else: # if it's a number 
-      x_out.append(x_vals[i]) 
-  return x_out 
+    @property
+    def error(self) -> np.ndarray:
+        return self._error
 
-""" Hamiltonian class: separately stores field-independent and field-dependent 
-    pieces of Hamiltonian matrix for quick recalculation at each point in the 
-    grid """
-class Hamiltonian: 
-  def __init__(self, ham0, hamx, hamy, hamz): 
-    self.zero = np.array(ham0) 
-    self.x = np.array(hamx) 
-    self.y = np.array(hamy) 
-    self.z = np.array(hamz) 
-  def at_field(self, field): 
-    # supply field as a three-membered list [Bx, By, Bz] 
-    return self.zero + field[0]*self.x + field[1]*self.y + field[2]*self.z 
+    @error.setter
+    def error(self, error_array: (list, np.ndarray)):
+        self._error = np.array(error_array)
+        # weights are reciprocal variance unless zero if found (because 0^-2 is infinite)
+        self._weights = np.array([r ** -2 if (0 not in r) else np.ones(len(r)) for r in self.error])
+        self._weights = np.array([r / r.sum() for r in self._weights])
+        if not isinstance(self._data, np.ndarray):
+            self._data = np.zeros(self._error.shape)
+        if np.shape(error_array) != self._data.shape:
+            self._data = self._data[:self._error.shape[0], :self._error.shape[1]]
+            padding = ((0, self._error.shape[0] - self._data.shape[0]), (0, self._error.shape[1] - self._data.shape[1]))
+            self._data = np.pad(self._data, padding)
+            self.simulation = np.zeros((self.num, len(self.tempfield)))
+            self.wrss = np.zeros(self._data.shape[0])
+        if not isinstance(self.centers, (list, np.ndarray)):
+            self.centers = [0] * self._data.shape[0]
+        elif len(self.centers) < self.num:
+            self.centers.extend([0] * (self.num - len(self.centers)))
+        if not isinstance(self._b_term, list):
+            self._b_term = [None] * self.num
+        elif len(self._b_term) < self.num:
+            self._b_term.extend([None] * (self.num - len(self._b_term)))
+        if not isinstance(self._constraints, (list, np.ndarray)):
+            self._constraints = [None] * self.num
+        elif len(self._constraints) < self._data.shape[0]:
+            self._constraints.extend([None] * (self.num - len(self._constraints)))
+        if not isinstance(self._error, np.ndarray):
+            self._error = np.zeros(self._data.shape)
 
-""" SpinSystem class: contains info on magnetic parameters and variables 
-    - Constructs 'Hamiltonian' objects when supplied with variable values 
-    - Reports spin expectation values when supplied with a mixed state """
-class SpinSystem: 
-  def __init__(self, spinlist): 
-    def mult(spin): # calculates multiplicity of a spin, returning an int 
-      return int(round(2*spin+1)) 
-    def spinX(spin): # construct a spin X matrix 
-      mat = [] 
-      m = float(spin) 
-      while m >= -spin: 
-        matrow = [] 
-        n = float(spin) 
-        while n >= -spin: 
-          if m==n+1 or m+1==n: 
-            matrow.append(np.sqrt(spin*(spin+1)-m*n)/(2.0)) 
-          else: 
-            matrow.append(0.0) 
-          n = n-1 
-        mat.append(matrow) 
-        m = m-1 
-      return mat 
-    def spinY(spin): # construct a spin Y matrix 
-      mat = [] 
-      m = float(spin) 
-      while m >= -spin: 
-        matrow = [] 
-        n = float(spin) 
-        while n >= -spin: 
-          if m==n+1 or m+1==n: 
-            matrow.append((m-n)*np.sqrt(spin*(spin+1)-m*n)/(2j)) 
-          else: 
-            matrow.append(0.0) 
-          n = n-1 
-        mat.append(matrow) 
-        m = m-1 
-      return mat 
-    def spinZ(spin): # construct a spin Z matrix 
-      mat = [] 
-      m = float(spin) 
-      while m >= -spin: 
-        matrow = [] 
-        n = float(spin) 
-        while n >= -spin: 
-          if m==n: 
-            matrow.append(float(n)) 
-          else: 
-            matrow.append(0.0) 
-          n = n-1 
-        mat.append(matrow) 
-        m = m-1 
-      return mat 
-    def kron(mats): # performs Kronecker product 
-      if len(mats)==0: 
-        return mats 
-      elif len(mats)==1: 
-        return mats[0] 
-      elif len(mats)==2: 
-        return np.kron(mats[0],mats[1]) 
-      else: 
-        return kron([np.kron(mats[0],mats[1])]+mats[2:]) 
-    
-    # make composite Cartesian spin operator matrices with Kronecker products 
-    # first, SX matrices 
-    mat = [] 
-    for m in range(len(spinlist)): 
-      matrow = [] 
-      for n in range(len(spinlist)): 
-        if m==n: 
-          matrow.append(spinX(spinlist[n])) 
-        else: 
-          matrow.append(np.identity(mult(spinlist[n]))) 
-      mat.append(matrow) 
-    sx = np.array(list(map(kron,mat))) 
-    # second, SY matrices 
-    mat = [] 
-    for m in range(len(spinlist)): 
-      matrow = [] 
-      for n in range(len(spinlist)): 
-        if m==n: 
-          matrow.append(spinY(spinlist[n])) 
-        else: 
-          matrow.append(np.identity(mult(spinlist[n]))) 
-      mat.append(matrow) 
-    sy = np.array(list(map(kron,mat))) 
-    # third, SZ matrices 
-    mat = [] 
-    for m in range(len(spinlist)): 
-      matrow = [] 
-      for n in range(len(spinlist)): 
-        if m==n: 
-          matrow.append(spinZ(spinlist[n])) 
-        else: 
-          matrow.append(np.identity(mult(spinlist[n]))) 
-      mat.append(matrow) 
-    sz = np.array(list(map(kron,mat))) 
-    # make a list of indices to keep exchange coupling in order 
-    mat = [] 
-    for i in range(len(spinlist)): 
-      for j in range(i+1,len(spinlist)): 
-        mat.append([i,j]) # ordered combinations of nonidentical spins 
-    # Update class variables 
-    self.jindex = np.array(mat) 
-    self.spins = list(spinlist) 
-    self.num = len(spinlist) 
-    self.SX = sx 
-    self.SY = sy 
-    self.SZ = sz 
-    self.S = np.array([sx, sy, sz]) 
-    self.zero = 0*sz[0] 
-    self.vars = None 
-  
-  def set_grid(self, intgrid): 
-    self.grid = intgrid 
-  
-  def set_mag_values(self, g_vals, d_vals, j_vals, eeG_vals, eeD_vals, jfact): 
-    self.g_vals = g_vals 
-    self.d_vals = d_vals 
-    self.j_vals = j_vals 
-    self.eeG_vals = eeG_vals 
-    self.eeD_vals = eeD_vals 
-    self.jfactor = jfact 
-  
-  def set_mag_variables(self, g_vars, d_vars, j_vars, eeG_vars, eeD_vars): 
-    self.g_vars = g_vars 
-    self.d_vars = d_vars 
-    self.j_vars = j_vars 
-    self.eeG_vars = eeG_vars 
-    self.eeD_vars = eeD_vars 
-  
-  def initiate_variables(self, var_names, var_bounds): 
-    self.var_names = var_names 
-    self.var_bounds = var_bounds 
-    self.vars = [bound.mean() for bound in var_bounds] 
-  
-  def set_vars(self, vars): 
-    self.vars = vars 
-  
-  def ham(self, vars=None): # makes Hamiltonian if no unresolved variables 
-    if vars is None: # if not provided with a new list of variables, use old 
-      vars = self.vars 
-    glist = resolve_variables(self.g_vals, self.g_vars, vars) 
-    dlist = resolve_variables(self.d_vals, self.d_vars, vars) 
-    jlist = resolve_variables(self.j_vals, self.j_vars, vars) 
-    eeGlist = resolve_variables(self.eeG_vals, self.eeG_vars, vars) 
-    eeDlist = resolve_variables(self.eeD_vals, self.eeD_vars, vars) 
-    
-    ham0 = np.array(self.zero) 
-    hamx = np.array(self.zero) 
-    hamy = np.array(self.zero) 
-    hamz = np.array(self.zero) 
-    
-    # construct Zeeman perturbation (field-dependent) 
-    for i in range(self.num): 
-      # isotropic g; e.g. [2.0] = [2.0,2.0,2.0] 
-      if len(glist[i]) == 1: 
-        hamx = hamx + zeemanFactor*glist[i][0]*self.SX[i] 
-        hamy = hamy + zeemanFactor*glist[i][0]*self.SY[i] 
-        hamz = hamz + zeemanFactor*glist[i][0]*self.SZ[i] 
-      # axial g without rotation; e.g. [2.0,2.1] = [2.0,2.0,2.1] 
-      elif len(glist[i])==2: 
-        hamx = hamx + zeemanFactor*glist[i][0]*self.SX[i] 
-        hamy = hamy + zeemanFactor*glist[i][0]*self.SY[i] 
-        hamz = hamz + zeemanFactor*glist[i][1]*self.SZ[i] 
-      # rhombic g without rotation; e.g. [2.0,2.1,2.2] 
-      elif len(glist[i])==3: 
-        hamx = hamx + zeemanFactor*glist[i][0]*self.SX[i] 
-        hamy = hamy + zeemanFactor*glist[i][1]*self.SY[i] 
-        hamz = hamz + zeemanFactor*glist[i][2]*self.SZ[i] 
-      # rhombic with rotation by Euler angles as [gx,gy,gz,alpha,beta,gamma] 
-      # or full 3x3 matrix [gxx,gxy,gxz,gyx,gyy,gyz,gzx,gzy,gzz] 
-      elif len(glist[i])==6 or len(glist[i])==9: 
-        if len(glist[i])==6: 
-          gmat = getgmat(glist[i]) 
-        else: 
-          gmat = np.array(glist[i]).reshape((3,3)) 
-        for j in range(3): 
-          hamx = hamx + zeemanFactor*gmat[0][j]*self.S[j][i] 
-          hamy = hamy + zeemanFactor*gmat[1][j]*self.S[j][i] 
-          hamz = hamz + zeemanFactor*gmat[2][j]*self.S[j][i] 
-      # unrecognized format 
-      else: 
-        raise_error('Uninterpretable g tensor:', str(glist[i])) 
-    # construct zero-field splitting perturbation (field-independent) 
-    for i in range(self.num): 
-      # no zero field splitting; i.e. []
-      if len(dlist[i])==0: 
-        continue 
-      # axial D without rotation; e.g. [3.0] = [-1.0,-1.0,2.0] 
-      elif len(dlist[i])==1: 
-        dval = float(dlist[i][0]) 
-        dmat = (-np.dot(self.SX[i],self.SX[i]) 
-                -np.dot(self.SY[i],self.SY[i]) 
-                +2.0*np.dot(self.SZ[i],self.SZ[i]))
-        ham0 = ham0 + (dval/3.0)*dmat 
-      # rhombic D w/o rotation [D,E/D]; e.g. [3.0,0.333333] = [-2.0,0.0,2.0] 
-      elif len(dlist[i])==2: 
-        dval = float(dlist[i][0]) 
-        eod = float(dlist[i][1]) 
-        dmat = dval*np.array([-1/3+eod,-1/3-eod,2/3]) 
-        ham0 = ham0 + (dmat[0]*np.dot(self.SX[i],self.SX[i]) 
-                      +dmat[1]*np.dot(self.SY[i],self.SY[i]) 
-                      +dmat[2]*np.dot(self.SZ[i],self.SZ[i])) 
-      # rhombic + rotate by Euler angles [D,E/D,alpha,beta,gamma] 
-      # or full 3x3 matrix: [Dxx,Dxy,Dxz,Dyx,Dyy,Dyz,Dzx,Dzy,Dzz] 
-      elif len(dlist[i])==5 or len(dlist[i])==9: 
-        if len(dlist[i])==5: 
-          dmat = getdmat(dlist[i]) 
-        else: 
-          dmat = np.array(dlist[i]).reshape((3,3)) 
-        for j in range(3): 
-          for k in range(3): 
-            ham0 = ham0+dmat[j][k]*np.dot(self.S[j][i],self.S[k][i]) 
-      # unrecognized format 
-      else: 
-        raise_error('Uninterpretable D tensor:', str(dlist[i])) 
-    # construct isotropic J coupling perturbation (field-independent) 
-    if len(jlist)>0: 
-      for i in range(len(self.jindex)): 
-        j,k = self.jindex[i] 
-        jmat = (np.dot(self.SX[j],self.SX[k]) 
-               +np.dot(self.SY[j],self.SY[k]) 
-               +np.dot(self.SZ[j],self.SZ[k])) 
-        ham0 = ham0 + self.jfactor*jlist[i]*jmat 
-    # construct antisymmetric vector G perturbation (field-independent) 
-    if len(eeGlist)>0: 
-      for i in range(len(self.jindex)): 
-        j,k = self.jindex[i] 
-        ct,st = [np.cos(eeGlist[i][1]), np.sin(eeGlist[i][1])] 
-        cf,sf = [np.cos(eeGlist[i][2]), np.sin(eeGlist[i][2])] 
-        eeGx,eeGy,eeGz = eeGlist[i][0]*np.array([cf*st,sf*st,ct]) 
-        eeG = np.array([np.dot(self.SY[j],self.SZ[k])
-                        -np.dot(self.SZ[j],self.SY[k]), 
-                        np.dot(self.SZ[j],self.SX[k])
-                        -np.dot(self.SX[j],self.SZ[k]), 
-                        np.dot(self.SX[j],self.SY[k])
-                        -np.dot(self.SY[j],self.SX[k])])  
-        ham0 = ham0 + eeGx*eeG[0]+eeGy*eeG[1]+eeGz*eeG[2] 
-    # construct anisotropic tensor D perturbation (field-independent) 
-    if len(eeDlist)>0: 
-      for i in range(len(self.jindex)): 
-        j,k = self.jindex[i] 
-        # no dipole-dipole coupling; i.e. []
-        if len(eeDlist[i])==0: 
-          continue 
-        # axial eeD w/o rotation; e.g. [3.0] = [-1.0,-1.0,2.0] 
-        elif len(eeDlist[i])==1: 
-          dval = float(eeDlist[i][0]) 
-          dmat = (-np.dot(self.SX[j],self.SX[k]) 
-                  -np.dot(self.SY[j],self.SY[k]) 
-                  +2.0*np.dot(self.SZ[j],self.SZ[k])) 
-          ham0 = ham0 + (dval/3.0)*dmat 
-        # rhombic eeD w/o rotation [eeD,eeE/eeD]; e.g. [3.0,0.3333] = [-2,0,2] 
-        elif len(eeDlist[i])==2: 
-          dval = float(eeDlist[i][0]) 
-          eod = float(eeDlist[i][1]) 
-          dmat = dval*np.array([-1/3+eod,-1/3-eod,2/3]) 
-          ham0 = ham0 + (dmat[0]*np.dot(self.SX[i],self.SX[i]) 
-                        +dmat[1]*np.dot(self.SY[i],self.SY[i]) 
-                        +dmat[2]*np.dot(self.SZ[i],self.SZ[i])) 
-        # rhombic + rotate by Euler angles [D,E/D,alpha,beta,gamma] 
-        # or full 3x3 matrix: [Dxx,Dxy,Dxz,Dyx,Dyy,Dyz,Dzx,Dzy,Dzz] 
-        elif len(eeDlist[i])==5 or len(eeDlist[i])==9: 
-          if len(eeDlist[i])==5: 
-            dmat = getdmat(eeDlist[i]) 
-          else: 
-            dmat = np.array(eeDlist[i]).reshape((3,3)) 
-          for j in range(3): 
-            for k in range(3): 
-              ham0 = (ham0 
-                     + dmat[j][k]*np.dot(self.S[j][i],self.S[k][i]))
-        # unrecognized format 
-        else: 
-          raise_error('Uninterpretable eeD tensor: '+str(eeDlist[i])) 
-    # make a 'Hamiltonian' object with these matrices 
-    return Hamiltonian(ham0,hamx,hamy,hamz) 
-  
-  def spin_expectation(self, state): 
-    # return spin expectation value at each center for a given state 
-    expect = [] 
-    for n in range(self.num): 
-      expectx = np.dot(np.dot(np.conjugate(state),self.SX[n]),state) 
-      expecty = np.dot(np.dot(np.conjugate(state),self.SY[n]),state) 
-      expectz = np.dot(np.dot(np.conjugate(state),self.SZ[n]),state) 
-      expect.append(np.array([expectx,expecty,expectz])/(-self.spins[n])) 
-    return np.real(np.array(expect)) 
+    @property
+    def weights(self):
+        return self._weights
 
-""" integrate: integrates spin projection vectors over a grid  
-    - requires temperature and field as scalars, and a SpinSystem variable 
-    - can take a variable list 
-    - returns [[lxSx, lySy, lzSz] for each spin] """
-def integrate(temperature,field, spinsystem, vars=None): 
-  sum = np.zeros((spinsystem.num, 3)) 
-  ham = spinsystem.ham(vars) 
-  for pt in spinsystem.grid.grid: 
-    contrib = np.zeros((spinsystem.num, 3)) 
-    eval,evec = eig(ham.at_field(field*np.array(pt[:3]))) 
-    print('DEBUG', eval)
-    print('DEBUG', evec)
-    eval = np.real(eval) # Hermitian so any imag part is numerical noise 
-    eval = eval - np.min(eval) # shift lowest level to 0 to prevent overflows 
-    eval = np.exp((boltzFactor/temperature)*eval) # exp(-E/(kB*T)) 
-    eval = eval/np.sum(eval) # exp(-E/(kB*T)) / sum_k[exp(-E_k/(kB*T))] 
-    for i in range(len(eval)): 
-      if eval[i] == 0.0: # if pop underflows (neg population), skip eigenstate 
-        continue 
-      contrib += eval[i]*spinsystem.spin_expectation(evec[:,i]) 
-    contrib = [pt[:3]*u for u in contrib] 
-    sum += pt[3]*np.array(contrib) 
-  return sum 
+    @property
+    def constraints(self):
+        return self._constraints
 
-""" reduce_pols_by_svd: 
-    - takes polarizations as a np.array 
-    - rhombicity can express one of two things: 
-      - if rhombicity > 0 this is taken as a user-selected dimension
-      - if rhombicity < 0 its absolute value is the collinearity cutoff 
-    - returns orthogonal composite polarizations 
-    - doesn't bother to reorganize or scale composite polarizations so 
-      hopefully slightly faster during fitting """ 
-def reduce_pols_by_svd(polarizations, rhombicity): 
-  U, s, Vh = svd(polarizations, full_matrices=False) 
-  if rhombicity < 0: 
-    s = s**2 
-    s = s/np.sum(s) 
-    rhombicity = sum(i > abs(rhombicity) for i in s) 
-  rhombicity = max(rhombicity, 1) 
-  return Vh[:rhombicity] 
+    @constraints.setter
+    def constraints(self, constraint_list=None):
+        self._constraints = [None] * self._data.shape[0]
+        if constraint_list is None:
+            constraint_list = [None] * self._data.shape[0]
+        if len(constraint_list) != self._data.shape[0]:
+            raise AttributeError('Number of constraints must equal number of transitions in data set')
+        for i in range(self._data.shape[0]):
+            if constraint_list[i] is None:
+                self._constraints[i] = None
+            elif isinstance(constraint_list[i], (list, np.ndarray)):
+                c = np.array(constraint_list[i])
+                if len(c.shape) == 1:
+                    c = c[np.newaxis, :]
+                if c.shape[1] not in [3, 9]:
+                    raise AttributeError(f'Uninterpretable constraint has dimension {c.shape}')
+                self._constraints[i] = c
+            else:
+                raise TypeError(f'Polarization constraint of unrecognized type {type(constraint_list[i])}')
 
-""" reduce_pols_by_svd_full: 
-    - takes polarizations as a np.array 
-    - rhombicity can express one of two things: 
-      - if rhombicity > 0 this is taken as a user-selected dimension
-      - if rhombicity < 0 its absolute value is the collinearity cutoff 
-    - returns [new_polarizations, conversion_matrix, normalized sing vals] """ 
-def reduce_pols_by_svd_full(polarizations, rhombicity): 
-  def transform_mat(mat): 
-    # returns a transformation matrix between the unitary SVD transformations 
-    # and something easier to interpret by the end user 
-    # 0. append an identity matrix to keep track of operations 
-    dim = len(mat[0]) 
-    mat = np.append(mat, np.eye(dim), axis=0).T 
-    # 1. reduce matrix (akin to red row echelon) 
-    for i in range(dim): 
-      pos = np.argmax(abs(mat[i,:-dim])) 
-      for j in range(dim): 
-        if i == j: 
-          mat[j] = (mat[j,pos]/abs(mat[j,pos]))*mat[j] # make positive 
-        else: 
-          mat[j] = mat[j]-(mat[j,pos]/mat[i,pos])*mat[i] 
-    # 2. normalize rows (just to standardize things) 
-    for i in range(dim): 
-      norm = np.sqrt(np.sum(mat[i,:-dim]**2)) 
-      mat[i] = mat[i]/norm 
-    # 3. rearrange (to bring closer to [Myz,Mzx,Mxy] order) 
-    maxpos = [np.argmax(abs(col)) for col in mat.T[:-dim]] 
-    rearr = [] 
-    for x in maxpos: 
-      if x not in rearr: rearr.append(x) 
-    for x in range(dim): 
-      if x not in rearr: rearr.append(x) 
-    mat = mat[rearr] 
-    # 4. return the transformation matrix (previously the identity matrix) 
-    return mat.T[-dim:] 
-  
-  U, s, Vh = svd(polarizations, full_matrices=False) 
-  Vh = np.dot(np.diag(s), Vh) 
-  s = s**2 
-  s = s/np.sum(s) 
-  if rhombicity < 0: 
-    rhombicity = sum(i > abs(rhombicity) for i in s) 
-  rhombicity = max(rhombicity, 1) 
-  U = U[:,:rhombicity]; Vh = Vh[:rhombicity] 
-  t = transform_mat(U) 
-  U = np.dot(t.T, U.T) 
-  Vh = np.dot(inv(t), Vh) 
-  return [Vh, U, s] 
+    @property
+    def polarizations(self):
+        return self._polarizations
 
-""" Polarization class: """
-class Polarization: 
-  def __init__(self, pol=[], constraint=[], center=0): 
-    self.center = center 
-    self.rss = None # residual sum of square error
-    self.wrss = None # weighted residual sum of square error 
-    self.reg = pol 
-    self.constraint = constraint 
-    self.svd = [] 
-    self.nsing = [] 
-    self.transform = [] 
-    self.covariance = [] 
+    @polarizations.setter
+    def polarizations(self, polarization_array):
+        self._polarizations = polarization_array
+        if not isinstance(self.centers, (list, np.ndarray)):
+            self.centers = [0] * self.num
+        elif len(self.centers) < self.num:
+            self.centers.extend([0] * (self.num - len(self.centers)))
+        if not isinstance(self._b_term, list):
+            self._b_term = [None] * self.num
+        elif len(self._b_term) < self.num:
+            self._b_term.extend([None] * (self.num - len(self._b_term)))
+        self.simulation = np.zeros((self.num, len(self.tempfield)))
 
-""" VTVHDataSet class: """
-class VTVHDataSet: 
-  def __init__(self, datafile=None, runtype=None): 
-    self.infile = datafile 
-    self.outfile = '' 
-    self.temp_field = [] # [[Temp1,Field1], [Temp2,Field2], [Temp3,Field3],...] 
-    self.num = 0 # number of transitions within datafile 
-    self.data = [] # [[y1,y2,y3...] for trans 1, [y1,y2,y3] for trans 2, ...] 
-    self.error = [] # [[z1,z2,z3...] for trans 1, [z1,z2,z3] for trans 2, ...] 
-    self.sim = [] # [[s1,s2,s3...] for trans 1, [s1,s2,s3] for trans 2, ...] 
-    self.polarizations = []  # [[Transition1], [Transition2], ...] 
-    if datafile is not None: 
-      self.read_datafile(datafile, runtype) 
-  
-  def read_datafile(self, datafile, runtype, encoding='utf-8'): 
-    self.infile = datafile 
-    def is_number(x): 
-      if isinstance(x, numeric): return True 
-      elif isinstance(x, str): # if it's a string, try to convert to a number 
-        try: 
-          return isinstance(float(x), float) 
-        except ValueError: 
-          return False 
-    with open(datafile, newline='', encoding=encoding) as csv_file: 
-      csv_reader = csv.reader(csv_file, delimiter=',') 
-      for row in csv_reader: 
-        if not is_number(row[0]): 
-          continue # nonnumeric entry in row[0] is interpreted as a header row 
-        row = np.array(row).astype(float) 
-        if runtype == 'fit': 
-          if len(row) >= 4 and len(row)%2 == 0: 
-            self.temp_field.append(row[:2]) # first two entries are [T,H] 
-            self.data.append(row[2::2]) # every other entry is data
-            self.error.append(row[3::2]) # every other entry is error 
-          else: 
-            raise_error('Improperly formatted row in data file', datafile, 
-                        '\n       ['+', '.join(row)+']',
-                        '\n       Found',str(len(row)), 
-                        'column(s), but expected an even number of at least 4',
-                        '\n       formatted as [Temp, Field, Data1, Error1,', 
-                                 'Data2, Error2, ...]') 
-        else: # 'simulation' so only grab [T,H] information 
-          if len(row)<2: 
-            raise_error('Improperly formatted row in data file', datafile, 
-                        '\n       ['+', '.join(row)+']',
-                        '\n       Rows must have at least two columns:', 
-                                 '[Temp, Field]') 
-          self.temp_field.append(row[:2]) 
-    self.temp_field = np.array(self.temp_field).astype(float) 
-    self.data = np.transpose(self.data).astype(float) 
-    self.error = np.transpose(self.error).astype(float) 
-    self.num = len(self.data) 
-  
-  def write_datafile(self, runtype): 
-    header = ['Temp', 'Field', 'bH/2kT'] 
-    for i in range(self.num): 
-      header.append('Sim '+str(i+1)) 
-      header.append('Data '+str(i+1)) 
-      header.append('Weight Dev '+str(i+1)) 
-    output = self.temp_field.T 
-    output = np.append(output, [htFactor*output[1]/output[0]], axis=0) 
-    for i in range(self.num): 
-      output = np.append(output, np.array([self.sim[i]]), axis=0) 
-      if runtype == 'fit': 
-        output = np.append(output, [self.data[i]], axis=0) 
-        output = np.append(output, 
-                           [(self.sim[i]-self.data[i])/self.error[i]], axis=0) 
-      else: 
-        output = np.append(output, [0*self.sim[i]], axis=0) 
-        output = np.append(output, [0*self.sim[i]], axis=0) 
-    output = np.append([header], output.T, axis=0) 
-    with open(self.outfile, mode='w') as output_file: 
-      writer = csv.writer(output_file, delimiter=',') 
-      for r in output: 
-        writer.writerow(r) 
-    
-  def get_pol_vectors(self, spinsystem, vars=None): 
-    directions = [integrate(temp, field, spinsystem, vars=vars) 
-                  for temp, field in self.temp_field] 
-    return np.transpose(np.array(directions), (1,2,0)) 
-  
-  def simulate(self, spinsystem, vars=None): 
-    pol_vectors = self.get_pol_vectors(spinsystem, vars=vars) 
-    sim = [] 
-    for i in range(self.num): 
-      pol = self.polarizations[i] 
-      if len(pol.reg) != 3: 
-        raise_error('Improper polarization during simulation') 
-      vector = pol_vectors[pol.center]
-      sim.append(np.dot(pol.reg, vector)) 
-    return np.array(sim) 
-  
-  def goodness_of_fit(self, spinsystem, vars=None, rhombicity=3): 
-    def func(x, *args): 
-      return np.dot(x, np.asarray(args)) 
-    pol_vectors = self.get_pol_vectors(spinsystem, vars=vars) 
-    red_vectors = np.array([reduce_pols_by_svd(vectors, rhombicity) 
-                            for vectors in pol_vectors]) 
-    cost = 0 
-    for i in range(self.num): 
-      pol = self.polarizations[i] 
-      if len(pol.constraint) == 0: 
-        xdata = np.transpose(red_vectors[pol.center]) 
-      elif len(pol.constraint) == 3: 
-        xdata = np.dot([pol.constraint], pol_vectors[pol.center]).T 
-      else: 
-        raise_error('Improper constraint', str(pol.constraint)) 
-      # initial guess unit polariz 
-      p0 = np.ones(len(xdata[0])).astype(float) 
-      ydata = self.data[i] 
-      sigma = self.error[i] 
-      popt, pcov = curve_fit(func, xdata, ydata, p0, 
-                             sigma=sigma, absolute_sigma=True) 
-      wrss = func(xdata, *popt) 
-      wrss = (ydata-wrss)/sigma 
-      cost += np.sum(wrss**2) 
-    return cost 
-  
-  def update_by_svd(self, spinsystem, vars=None, rhombicity=3): 
-    def func(x, *args): 
-      return np.dot(x, np.asarray(args)) 
-    pol_vectors = self.get_pol_vectors(spinsystem, vars=vars) 
-    red_vectors = [reduce_pols_by_svd_full(vectors, rhombicity) 
-                   for vectors in pol_vectors] 
-    for i in range(self.num): 
-      pol = self.polarizations[i] 
-      if len(pol.constraint) == 0: 
-        nsing = red_vectors[pol.center][2] # normalized singular values 
-        conv = red_vectors[pol.center][1]
-        xdata = np.transpose(red_vectors[pol.center][0]) 
-      elif len(pol.constraint) == 3: 
-        xdata = np.dot([pol.constraint], pol_vectors[pol.center]).T 
-      else: 
-        raise_error('Improper constraint', str(pol.constraint)) 
-      ydata = self.data[i] 
-      sigma = self.error[i] 
-      p0 = np.ones(len(xdata[0])).astype(float) # initial guess unit polariz 
-      popt, pcov = curve_fit(func, xdata, ydata, p0, 
-                             sigma=sigma, absolute_sigma=True) 
-      rss = (ydata-func(xdata, *popt)) 
-      wrss = rss/sigma 
-      rss = np.sum(rss**2) 
-      wrss = np.sum(wrss**2) 
-      pol.svd = popt 
-      if len(pol.constraint) == 0: 
-        pol.nsing, pol.rss, pol.wrss = nsing, rss, wrss 
-        pol.covariance = pcov 
-        pol.transform = conv 
-        pol.reg = np.dot(pinv(conv), popt) 
-      else: 
-        pol.rss, pol.wrss = rss, wrss 
-        pol.covariance = pcov 
-        pol.transform = None 
-        pol.reg = popt*pol.constraint 
+    @property
+    def b_term(self):
+        return self._b_term
 
-""" fit_at_each_particle: calculates the cost at each particle position """
-def fit_at_each_particle(vars_of_each_particle, spinsys, datasets, 
-                         rhombicity, printall=False): 
-  wrss = [] 
-  for particle in vars_of_each_particle: 
-    cost = 0 
-    for dataset in datasets: 
-      cost += dataset.goodness_of_fit(spinsys, vars=particle, 
-                                      rhombicity=rhombicity) 
-    if printall: 
-      print('Particle at', str(particle), 'with WRSS =', str(cost)) 
-    wrss.append(cost) 
-  return wrss 
+    @b_term.setter
+    def b_term(self, b_array: list):
+        if len(b_array) != self.num:
+            raise AttributeError(f'B term intensity (or lack thereof) must be provided for each transition')
+        self._b_term = b_array
 
-""" particle_swarm_fit: performs the particle swarm optimization and (if 
-    requested) writes the history of particle movements to a file """
-def particle_swarm_fit(spinsystem, list_of_datasets, settings): 
-  options = {'c1': settings['swarm']['personal'], 
-             'c2': settings['swarm']['social'], 
-             'w': settings['swarm']['inertial']} 
-  bounds = np.array(spinsystem.var_bounds) 
-  bounds = [bounds[:,0],bounds[:,1]] 
-  if settings['swarm']['parallel'] < 1: settings['swarm']['parallel'] = None 
-  optimizer=ps.single.GlobalBestPSO(n_particles=settings['swarm']['particles'], 
-                                    dimensions=len(spinsystem.var_names), 
-                                    options=options, bounds=bounds) 
-  cost, pos = optimizer.optimize(fit_at_each_particle, 
-                                 iters=settings['swarm']['iterations'], 
-                                 n_processes=settings['swarm']['parallel'], 
-                                 spinsys=spinsystem, 
-                                 datasets=list_of_datasets, 
-                                 rhombicity=settings['rhombicity'], 
-                                 printall=settings['swarm']['print']) 
-  print('Particle swarm variable optimization finished') 
-  if settings['swarm']['history'] is not None: 
-    with open(settings['swarm']['history'], mode='w') as output_file: 
-      writer = csv.writer(output_file, delimiter=',') 
-      header1 = ['','']+[i+1 for i in range(settings['swarm']['particles']) 
-                             for __ in range(len(spinsystem.var_names))] 
-      writer.writerow(header1) 
-      header2 = spinsystem.var_names*settings['swarm']['particles'] 
-      header2 = ['Iter','Cost']+header2 
-      writer.writerow(header2) 
-      best_cost = np.inf 
-      cost_history = optimizer.cost_history 
-      pos_history = optimizer.pos_history 
-      vel_history = optimizer.velocity_history 
-      for i in range(len(cost_history)): 
-        if cost_history[i] < best_cost: 
-          best_cost = cost_history[i] 
-          print('Iteration', str(i+1)+': Global best cost', str(best_cost)) 
-        row = [i+1, cost_history[i]] 
-        for j in range(len(pos_history[i])): 
-          row += list(pos_history[i][j]) 
-        writer.writerow(row) 
-    print('Particle movement history printed to', 
-          settings['swarm']['history'], '\n') 
-  return [cost, pos] 
+    def read_file(self, filename: str = None) -> None:
+        """Attempts to read file `filename` and returns the number of rows of data found in the file. Raises
+        RuntimeError if the file cannot be opened or cannot be parsed."""
+        if filename is None:
+            filename = self.filename
+        header = 0
+        while True:
+            try:
+                data = np.loadtxt(filename, delimiter=',', skiprows=header)
+            except ValueError:
+                header += 1
+                continue
+            break
+        if data.shape[0] == 0:
+            raise RuntimeError(f'File {filename} contained no readable data')
+        if data.shape[1] < 2:
+            raise RuntimeError(f'Incorrectly formatted file {filename} has too few columns')
+        if data.shape[1] % 2 == 1:
+            raise RuntimeError(f'Incorrectly formatted file {filename} has an odd number of columns')
+        self.filename, self.header = filename, header
+        self.tempfield = data[:, :2].astype(float)
+        if not all(self.tempfield[:, 0] > 0):
+            temps = self.tempfield[:, 0]
+            raise ValueError('All temperatures must be absolute and must therefore be positive '
+                             f'but nonpositive values were found: {temps[temps <= 0]}')
+        data = data[:, 2:].T
+        self.data = data[0::2]  # every other row is data; if no data supplied, returns a (0, n)-shaped array
+        self.error = data[1::2]  # interspersed by error; if no data supplied, returns a (0, n)-shaped array
+        if self.centers is None:
+            self.centers = [0] * self.num
+        if self.constraints is None:
+            self.constraints = [None] * self.num
 
-""" read_yaml: A giant function that interprets user input from the 
-    YAML file. Returns [settings, spin_system, datasets]. These are: 
-    - settings: a list of settings for the run 
-    - spin_system: a SpinSystem object containing all requisite information 
-      to construct the spin Hamiltonian on the fly 
-    - datasets: a list of VTVHDataSet objects """
-def read_yaml(filename): 
-  settings=dict() # make an empty dict in which to keep user settings etc. 
-  variables=[] # an empty list of variable names 
-  def lower(x): # if x is a string make lowercase, else return unchanged 
-    return x.lower() if isinstance(x,str) else x 
-  def pairs(x): # returns number of unordered pairs among x elements 
-    return x*(x-1)/2 
-  def fetch_val(yaml, str, default=None): 
-    try: 
-      return yaml[str] 
-    except KeyError: 
-      return default 
-  def check_shape(mat, shapes): 
-    # a g tensor can have shapes [1,2,3,6,9] 
-    # a D tensor can have shapes [0,1,2,5,9] 
-    # a eeG vector can have shape [0,3] 
-    # a eeD vector can have shapes [0,1,2,5,9] 
-    if not isinstance(mat, list): 
-      return False 
-    if not len(mat) in shapes: 
-      return False 
-    for x in mat: 
-      if not isinstance(x, numeric) and not isinstance(x, str): 
-        return False 
-    return True 
-  def scan_params(x): # search for fit vars and add accumulate in `variables' 
-    nonlocal variables 
-    if isinstance(x, (int,float)): 
-      return True 
-    elif isinstance(x, str): 
-      if x not in variables: variables.append(x) 
-      return True 
-    elif isinstance(x, list): 
-      return all([scan_params(y) for y in x]) 
-    else: 
-      return False 
-  def index_vars(x): # switches to proper numeric indices from variable names 
-    nonlocal variables 
-    if isinstance(x, (int,float)): 
-      return None 
-    elif isinstance(x, str): 
-      try: 
-        return variables.index(x) 
-      except ValueError: 
-        raise_error('Error indexing variables:', str(x), 
-                    'not in', str(variables)) 
-    elif isinstance(x, (list, np.ndarray)): 
-      return [index_vars(y) for y in x] 
-    else: 
-      raise_error('Error indexing variables: uninterpretable', str(x)) 
-  
-  try: 
-    file = open(filename, 'r') 
-    cfg = safe_load(file) 
-    file.close() 
-  except FileNotFoundError: 
-    raise_error('Input file not found', filename)
-  
-  settings['type'] = lower(fetch_val(cfg, 'type')) 
-  if settings['type'] == 'sim': settings['type'] = 'simulation' 
-  if settings['type'] is None: 
-    raise_error('No run type specified') 
-  elif settings['type'] not in ['simulation', 'fit']: 
-    raise_error('Unrecognized run type requested: '+str(settings['type'])) 
-  else: 
-    print('Run type:', settings['type']) 
-  print('Finding data file(s)...') 
-  settings['data'] = fetch_val(cfg, 'data') 
-  if settings['data'] is None: raise_error('No data file specified') 
-  if not isinstance(settings['data'], list): 
-    raise_error('Uninterpretable non-list data specification') 
-  if not all([isinstance(x, dict) for x in settings['data']]): 
-    raise_error('Incorrectly formatted list of data files') 
-  datasets = [] 
-  for i in range(len(settings['data'])): 
-    if 'file' not in settings['data'][i]: 
-      raise_error('File name missing for data file entry number', str(i+1)) 
-    if not isinstance(settings['data'][i]['file'], str): 
-      raise_error('File names not all strings; try enclosing in quotes') 
-    if 'out' not in settings['data'][i]: 
-      settings['data'][i]['out'] = settings['data'][i]['file']+'.out.csv' 
-    if not isinstance(settings['data'][i]['out'], str): 
-      raise_error('Output file names not all strings; try enclosing in quotes') 
-    print('- Reading document',str(i+1)+':',settings['data'][i]['file']) 
-    x = VTVHDataSet(settings['data'][i]['file'], settings['type']) 
-    x.outfile = settings['data'][i]['out'] 
-    if settings['type'] == 'simulation': 
-      # simulations require polarizations and accept center specifications 
-      if 'polarizations' not in settings['data'][i]: 
-        raise_error('Simulations require polarization info for each data set') 
-      if not isinstance(settings['data'][i]['polarizations'], list): 
-        raise_error('Polarizations must be in list form') 
-      # check if we've been given a single polarization rather list of them 
-      if all([isinstance(x, numeric) 
-              for x in settings['data'][i]['polarizations']]): 
-        settings['data'][i]['polarizations'] = \
-          [settings['data'][i]['polarizations']] 
-      if 'centers' not in settings['data'][i]: 
-        settings['data'][i]['centers'] = \
-          [1]*len(settings['data'][i]['polarizations'])
-      # check if we've been given a single center rather than list of them 
-      if isinstance(settings['data'][i]['centers'], int): 
-        settings['data'][i]['centers'] = [settings['data'][i]['centers']] 
-      settings['data'][i]['centers'] = [k-1 for k 
-                                        in settings['data'][i]['centers']] 
-      if (len(settings['data'][i]['centers']) != 
-          len(settings['data'][i]['polarizations'])): 
-        raise_error('Number of centers specified different', 
-                    'from number of polarizations') 
-      for j in range(len(settings['data'][i]['polarizations'])): 
-        if len(settings['data'][i]['polarizations'][j]) != 3: 
-          print('  - Transition',str(j+1)) 
-          raise_error('Polarizations for simulation must be 3-membered lists') 
-        if not isinstance(settings['data'][i]['centers'][j], int): 
-          print('  - Transition',str(j+1)) 
-          raise_error('Centers must be integers, but', 
-                      str(settings['data'][i]['centers'][j]), 
-                      'is a', type(settings['data'][i]['centers'][j])) 
-        print('  - Transition', str(j+1), 'on center', 
-              str(settings['data'][i]['centers'][j]+1)) 
-        x.polarizations.append(
-                Polarization(pol=settings['data'][i]['polarizations'][j], 
-                center=settings['data'][i]['centers'][j])) 
-    else: # 'fit' 
-      # fits don't require polarizations, but if specified can only be (0/3) 
-      # also accept center specifications 
-      if 'polarizations' not in settings['data'][i]: 
-        settings['data'][i]['polarizations'] = [[]]*x.num 
-      if 'centers' not in settings['data'][i]: 
-        settings['data'][i]['centers'] = [1]*x.num 
-      # check if we have a single polarization rather than list of them 
-      if all([isinstance(x, (float,int)) 
-             for x in settings['data'][i]['polarizations']]): 
-        settings['data'][i]['polarizations'] = \
-          [settings['data'][i]['polarizations']] 
-      # check if we have a single center rather than list of them 
-      if isinstance(settings['data'][i]['centers'], int): 
-        settings['data'][i]['centers'] = [settings['data'][i]['centers']] 
-      settings['data'][i]['centers'] = [k-1 for k 
-                                        in settings['data'][i]['centers']] 
-      if len(settings['data'][i]['polarizations']) != x.num: 
-        raise_error('Number of polarizations specified different', 
-                    'from number of transitions in file') 
-      if len(settings['data'][i]['centers']) != x.num: 
-        raise_error('Number of centers specified different', 
-                    'from number of transitions in file') 
-      for j in range(x.num): 
-        if len(settings['data'][i]['polarizations'][j]) not in [0,3]: 
-          print('  - Transition',str(j+1)) 
-          raise_error('Polarization constraints for fitting must be', 
-                      '0- or 3-membered lists') 
-        if not isinstance(settings['data'][i]['centers'][j], int): 
-          print('  - Transition',str(j+1)) 
-          raise_error('Centers must be integers, but', 
-                      str(settings['data'][i]['centers'][j]), 
-                      'is a', type(settings['data'][i]['centers'][j])) 
-        pol = settings['data'][i]['polarizations'][j] 
-        if np.sum(np.array(pol)**2) < 1e-6: # if constraint = zero vector 
-          pol = [] 
-        center = settings['data'][i]['centers'][j] 
-        print('  - Transition', str(j+1), 'on center', str(center+1)) 
-        x.polarizations.append(Polarization(constraint=pol, center=center)) 
-    x.num = len(x.polarizations) 
-    datasets.append(x) 
-  print('Reading data file(s)...') 
-  print('Looking for output file name(s)...') 
-  
-  print('\nReading spins...') 
-  spins = fetch_val(cfg, 'spins', []) 
-  if not isinstance(spins, list): spins = [spins] 
-  if len(spins) == 0: 
-    print('- No list of spins found') 
-    print('- Assuming one spin-1/2 center') 
-    spins = [0.5] 
-  for i in range(len(spins)): 
-    if not isinstance(spins[i], (int,float)): 
-      raise_error('Improper spin:',str(spins[i])) 
-    if spins[i] > 0: 
-      spins[i] = int(round(2*spins[i]))/2 # round to nearest half integer 
-    else: 
-      raise_error('Diamagnet or improper spin:',str(spins[i])) 
-  print('Constructing spin operator matrices...') 
-  spin_system = SpinSystem(spins) 
-  print('Reading g tensors...') 
-  gvalues = fetch_val(cfg, 'gvalues', []) 
-  if not isinstance(gvalues, list): 
-    raise_error('g Tensor(s) must be provided as list of lists not', 
-                str(gvalues)) 
-  elif len(gvalues) == 0: 
-    print('- No g tensor information provided') 
-    print('- Assuming all spins have isotropic g=2.0023') 
-    gvalues = [[2.0023]]*spin_system.num
-  elif len(gvalues) != spin_system.num: 
-    raise_error('Improper number of g tensors') 
-  for i in gvalues: 
-    if not isinstance(i, list): 
-      raise_error('Individual g tensors must be provided as lists not',str(i)) 
-    if not check_shape(i, [1,2,3,6,9]): 
-      raise_error('Uninterpretable g tensor of',str(i)) 
-  print('Reading D (ZFS) tensors...') 
-  Dvalues = fetch_val(cfg, 'Dvalues', []) 
-  if not isinstance(Dvalues, list): 
-    raise_error('D Tensor(s) must be provided as list of lists not', 
-                str(Dvalues)) 
-  elif len(Dvalues) == 0: 
-    print('- No D tensor information provided') 
-    print('- Assuming all spins lack zero-field splitting') 
-    Dvalues = [[]]*spin_system.num 
-  elif len(Dvalues) != spin_system.num: 
-    raise_error('Improper number of D tensors') 
-  for i in Dvalues: 
-    if not isinstance(i, list): 
-      raise_error('Individual D tensors must be provided as lists, not',str(i)) 
-    if not check_shape(i, [0,1,2,5,9]): 
-      raise_error('Uninterpretable D tensor of',str(i)) 
-  if spin_system.num == 1: 
-    print('Single spin, so skipped exchange coupling') 
-    Jvalues, eeGvalues, eeDvalues, Jfactor = [[], [], [], 1.0] 
-  else: 
-    print('Reading superexchange parameters...') 
-    Jvalues = fetch_val(cfg, 'Jvalues', []) 
-    eeGvalues = fetch_val(cfg, 'eeGvalues', []) 
-    eeDvalues = fetch_val(cfg, 'eeDvalues', []) 
-    Jfactor = fetch_val(cfg, 'Jfactor', 1.0) 
-    if not isinstance(Jfactor, (int,float)): 
-      raise_error('Inappropriate Jfactor value of',str(Jfactor)) 
-    else: 
-      terms = {1.0: '+J', 2.0: '+2J', -1.0: '-J', -2.0: '-2J'} 
-      try: 
-        x = terms[round(Jfactor,1)] 
-      except KeyError: 
-        x = str(Jfactor) if Jfactor<0 else '+'+str(Jfactor) 
-      print('- Using',x,'term in Hamiltonian') 
-    if not isinstance(Jvalues, list): Jvalues = [Jvalues] 
-    if not isinstance(eeGvalues, list): eeGvalues = [eeGvalues] 
-    if not isinstance(eeDvalues, list): eeDvalues = [eeDvalues] 
-    if len(Jvalues)>0: 
-      if not check_shape(Jvalues, [pairs(spin_system.num)]): 
-        print('Improper Jvalues list of',str(Jvalues)) 
-        Jvalues = []
-        for x in range(spin_system.num): 
-          for y in range(x+1,spin_system.num): 
-            Jvalues.append('J'+str(x+1)+str(y+1)) 
-        Jvalues = ','.join(Jvalues) 
-        raise_error('Expected list of form ['+Jvalues+']') 
-      print('- Found isotropic (scalar) J coupling') 
-    else: print('- No isotropic (scalar) J coupling found') 
-    if len(eeGvalues)!=0 and len(eeGvalues)!=pairs(spin_system.num): 
-      print('Improper number of entries in eeGvalues list:',str(eeGvalues)) 
-      eeGvalues = []
-      for x in range(spin_system.num): 
-        for y in range(x+1,spin_system.num): 
-          eeGvalues.append('G'+str(x+1)+str(y+1)) 
-      eeGvalues = ','.join(eeGvalues) 
-      raise_error('Expected list of form ['+eeGvalues+']') 
-    else: 
-      for x in range(len(eeGvalues)): 
-        if not isinstance(eeGvalues[x], list): 
-          print('eeGvalues entry',str(x+1),'is not a list:',str(eeGvalues[x])) 
-          raise_error('Expected [r,theta,phi]') 
-        if not check_shape(eeGvalues[x], [3]): 
-          print('eeGvalues entry',str(x+1),'uninterpretable:',str(eeGvalues[x])) 
-          raise_error('Expected [r,theta,phi]') 
-      if len(eeGvalues)==0: 
-        print('- No antisymmetric (vector) eeG coupling found') 
-      else: 
-        print('- Found antisymmetric (vector) eeG coupling') 
-    if len(eeDvalues)!=0 and len(eeDvalues)!=pairs(spin_system.num): 
-      print('Improper number of entries in eeDvalues list:',str(eeDvalues)) 
-      eeDvalues = []
-      for x in range(spin_system.num): 
-        for y in range(x+1,spin_system.num): 
-          eeDvalues.append('D'+str(x+1)+str(y+1)) 
-      eeDvalues = ','.join(eeDvalues) 
-      raise_error('Expected list of form ['+eeDvalues+']') 
-    else: 
-      for x in range(len(eeDvalues)): 
-        if not isinstance(eeDvalues[x], list): 
-          raise_error('Each eeD tensor must be provided as a list, not', 
-                      str(eeDvalues[x])) 
-        if not check_shape(eeDvalues[x], [0,1,2,5,9]): 
-          raise_error('eeDvalues entry',str(x+1),'uninterpretable:', 
-                      str(eeGvalues[x])) 
-      if len(eeDvalues)==0: 
-        print('- No anisotropic (tensor) eeD coupling found') 
-      else: 
-        print('- Found anisotropic (tensor) eeD coupling') 
-  if not all(map(scan_params,[gvalues,Dvalues,Jvalues,eeGvalues,eeDvalues])): 
-    if not scan_params(gvalues): print('Unexpected issue with gvalues') 
-    if not scan_params(Dvalues): print('Unexpected issue with Dvalues') 
-    if not scan_params(Jvalues): print('Unexpected issue with Jvalues') 
-    if not scan_params(eeGvalues): print('Unexpected issue with eeGvalues') 
-    if not scan_params(eeDvalues): print('Unexpected issue with eeDvalues') 
-    raise_error('Problem scanning variables') 
-  gvars = index_vars(gvalues) 
-  dvars = index_vars(Dvalues) 
-  jvars = index_vars(Jvalues) 
-  eeGvars = index_vars(eeGvalues) 
-  eeDvars = index_vars(eeDvalues) 
-  if len(variables) > 0: 
-    if settings['type'] == 'simulation': 
-      raise_error('No variables allowed in simulation run') 
-    print('Locating bounds for magnetic variables...') 
-  var_bounds = [] 
-  for i in variables: 
-    bound = fetch_val(cfg, i) 
-    if bound is None: raise_error('No bounds found for variable',str(i)) 
-    if settings['type'] == 'fit': 
-      if not isinstance(bound, list): 
-        raise_error('Bounds for variable "'+str(i)+'" not a two-element list') 
-      if len(bound) != 2: 
-        raise_error('Bounds for variable "'+str(i)+'" not a two-element list') 
-      if all([isinstance(x, (int,float)) for x in bound]): 
-        var_bounds.append(np.sort(np.array(bound))) 
-      else: raise_error('Bounds for variable "'+str(i)+'" must be numeric') 
-    else: # 'grid' 
-      if not isinstance(bound, list): 
-        raise_error('Bounds for variable "'+str(i)+'" not a three-element list') 
-      if len(bound) != 3: 
-        raise_error('Bounds for variable "'+str(i)+'" not a three-element list') 
-      if all([isinstance(x, (int,float)) for x in bound]): 
-        var_bounds.append(np.sort(np.array(bound))) 
-      else: raise_error('Bounds for variable "'+str(i)+'" must be numeric') 
-  spin_system.set_mag_values(gvalues, Dvalues, 
-                             Jvalues, eeGvalues, eeDvalues, Jfactor) 
-  spin_system.set_mag_variables(gvars, dvars, jvars, eeGvars, eeDvars) 
-  spin_system.initiate_variables(variables, var_bounds) 
-  rhombicity = {1: 'isotropic', 2: 'axial', 3: 'rhombic'} 
-  # detect magnetic symmetry from g and D tensors 
-  auto_rhomb = max(max([min(len(x),  3) for x in gvalues]), 
-              max([min(len(x)+1,3) for x in Dvalues])) 
-  if len(eeGvalues) > 0: 
-    auto_rhomb = 3 
-  if len(eeDvalues) > 0: 
-    auto_rhomb = max(auto_rhomb, max([min(len(x)+1,3) for x in eeDvalues])) 
-  print('This is likely a maximally',rhombicity[auto_rhomb],'system') 
-  print('Magnetic parameters read without error\n') 
-  
-  print('Contructing integration grid...') 
-  method = lower(fetch_val(cfg, 'method', 'gaussian')) 
-  grid = fetch_val(cfg, 'grid', 0) 
-  domain = lower(fetch_val(cfg, 'domain', 'auto')) 
-  intgrid = IntegrationGrid(method, grid, domain) 
-  spin_system.set_grid(intgrid) 
-  if settings['type'] == 'fit': 
-    print('Reading particle swarm parameters for fitting...') 
-    settings['swarm'] = fetch_val(cfg, 'swarm') 
-    if settings['swarm'] is not None: 
-      try: 
-        settings['swarm'] = {x: y 
-                             for z in settings['swarm'] for x,y in z.items()} 
-      except: 
-        raise_error('Cannot interpret particle swarm parameters')
-    else: 
-      settings['swarm'] = dict() 
-    if 'personal' not in settings['swarm']: 
-      settings['swarm']['personal'] = 2.5 
-    if 'social' not in settings['swarm']: 
-      settings['swarm']['social'] = 1.3 
-    if 'inertial' not in settings['swarm']: 
-      settings['swarm']['inertial'] = 0.40 
-    if 'particles' not in settings['swarm']: 
-      settings['swarm']['particles'] = 20 
-    if 'iterations' not in settings['swarm']: 
-      settings['swarm']['iterations'] = 20 
-    if 'parallel' not in settings['swarm']: 
-      settings['swarm']['parallel'] = 0 
-    if 'print' not in settings['swarm']: 
-      settings['swarm']['print'] = False 
-    if 'history' not in settings['swarm']: 
-      settings['swarm']['history'] = None 
-    if not isinstance(settings['swarm']['personal'], (int,float)): 
-      raise_error('Improper particle swarm personal (cognitive, c1) parameter') 
-    if not isinstance(settings['swarm']['social'], (int,float)): 
-      raise_error('Improper particle swarm social (group, c2) parameter') 
-    if not isinstance(settings['swarm']['inertial'], (int,float)): 
-      raise_error('Improper particle swarm inertial (w) parameter') 
-    if not isinstance(settings['swarm']['particles'], int): 
-      raise_error('Improper particle swarm number of particles') 
-    if not isinstance(settings['swarm']['iterations'], int): 
-      raise_error('Improper particle swarm number of iterations') 
-    if not isinstance(settings['swarm']['parallel'], int): 
-      raise_error('Must specify an integer number of processors') 
-    if settings['swarm']['parallel'] < 0: 
-      raise_error('Must specify a positive number of processors') 
-    if lower(settings['swarm']['print']) in [True,1,'true','yes']: 
-      settings['swarm']['print'] = True 
-    elif lower(settings['swarm']['print']) in [False,0,'false','no']: 
-      settings['swarm']['print'] = False 
-    else: raise_error('Improper particle swarm printing setting') 
-    if settings['swarm']['history'] is not None: 
-      if not isinstance(settings['swarm']['history'], str): 
-        raise_error('Improper particle swarm history destination') 
-    print('Reading other fitting parameters...') 
-    settings['statistics'] = lower(fetch_val(cfg, 'statistics', True))
-    if settings['statistics'] in [True, 1, 'true', 'yes']: 
-      settings['statistics'] = True 
-    elif settings['statistics'] in [False, 0, 'false', 'no']: 
-      settings['statistics'] = False 
-    else: raise_error('Improper statistics flag') 
-    settings['rhombicity'] = lower(fetch_val(cfg, 'rhombicity', 'auto')) 
-    rhomb = {-1: -1, 0: 0, 1: 1, 2: 2, 3: 3, 'dynamic': -1, 'auto': 0, 
-             'isotropic': 1, 'axial': 2, 'rhombic': 3} 
-    if settings['rhombicity'] in [-1, 0, 1, 2, 3, 'auto', 
-                                  'dynamic', 'isotropic', 'axial', 'rhombic']: 
-      settings['rhombicity'] = rhomb[settings['rhombicity']] 
-    else: 
-      raise_error('Unrecognized user-input rhombicity', settings['rhombicity']) 
-    settings['collinearity'] = fetch_val(cfg, 'collinearity', 6) 
-    if not isinstance(settings['collinearity'], (int,float)): 
-      raise_error('Problem in collinearity setting') 
-    if settings['collinearity'] < 1: 
-      raise_error('Collinearity settings must be greater than 1') 
-  
-  print('\nSummary of job:') 
-  print('- Run type:', settings['type']) 
-  print('- Data file(s):') 
-  for i in range(len(datasets)): 
-    print('  -', settings['data'][i]['file'], 
-               'with', str(datasets[i].num), 
-               'transition(s) at', str(len(datasets[i].temp_field)), 'points') 
-    print('    - Output written to', str(datasets[i].outfile)) 
-    for j in range(datasets[i].num): 
-      pol = datasets[i].polarizations[j] 
-      if 0 <= pol.center < spin_system.num: 
-        if settings['type'] == 'simulation': 
-          print('    - Transition', str(j+1), 'on center', str(pol.center+1),
-                      'polarized as') 
-          if len(pol.reg) == 3: 
-            print('      [Myz,Mzx,Mxy] =', str(pol.reg)) 
-          else: raise_error('Inappropriate polarization for simulation') 
-        else: # 'fit' 
-          if len(pol.constraint) == 0: 
-            print('    - Transition', str(j+1), 'on center', str(pol.center+1), 
-                        'unconstrained') 
-          elif len(pol.constraint) == 3: 
-            print('    - Transition', str(j+1), 'on center', str(pol.center+1), 
-                        'constrained parallel to') 
-            print('      [Myz,Mzx,Mxy] =', str(pol.constraint)) 
-          else: raise_error('Inappropriate polarization for fitting') 
-      else: raise_error('Center out of range:', str(datasets[i].centers[j]+1)) 
-  print('- Numerical integration') 
-  if intgrid.method == 'gaussian': 
-    print('  - Method: Gaussian quadrature') 
-    print('  - Domain:', intgrid.domain) 
-    print('  - Polar degree of', intgrid.deg[0]) 
-    print('  - Azimuthal degree of', intgrid.deg[1]) 
-    print('  - Overall grid of', intgrid.size, 'points') 
-  elif intgrid.method == 'lebedev': 
-    print('  - Method: Lebedev quadrature') 
-    print('  - Domain:', intgrid.domain) 
-    print('  - Precision degree of', intgrid.deg) 
-    print('  - Overall grid of', intgrid.size, 'points') 
-  elif intgrid.method == 'discrete': 
-    print('  - Method: Discrete (user-defined)') 
-    print('  - Domain specified by user') 
-    print('  - Overall grid of', intgrid.size, 'points') 
-  if settings['type'] == 'fit': 
-    if len(spin_system.var_names) > 0: 
-      print('- Particle swarm fitting parameters') 
-      print('  - Personal/cognitive (c1) parameter:', 
-                 str(settings['swarm']['personal'])) 
-      print('  - Social/group (c2) parameter:', 
-                 str(settings['swarm']['social'])) 
-      print('  - Inertial (w) parameter:', 
-                 str(settings['swarm']['inertial'])) 
-      print('  -',str(settings['swarm']['particles']),'particles') 
-      print('  -',str(settings['swarm']['iterations']),'iterations') 
-      if settings['swarm']['parallel'] > 1: 
-        print('  -',str(settings['swarm']['parallel']),'parallel processes') 
-      else:
-        print('  - Serial execution') 
-      if settings['swarm']['print']: 
-        print('  - Full (unprocessed) particle position printing requested') 
-      if settings['swarm']['history'] is not None: 
-        print('  - Particle position history to be written to', 
-                   settings['swarm']['history']) 
-    else: 
-      print('- No variables require particle swarm fitting')
-    print('- Other fitting parameters') 
-    if settings['statistics']: 
-      print('  - Statistical analysis enabled') 
-    else: print('  - Statistics module disabled') 
-    if settings['rhombicity'] == 0: 
-      print('  - Automatic symmetry detection used') 
-      settings['rhombicity'] = auto_rhomb 
-    elif settings['rhombicity'] == -1: 
-      print('  - Dynamically updated rhombicity') 
-      settings['rhombicity'] = -10.0**(-settings['collinearity']) 
-    elif settings['rhombicity'] == 1: 
-      print('  - User-specified isotropic symmetry enforced') 
-    elif settings['rhombicity'] == 2: 
-      print('  - User-specified axial symmetry enforced') 
-    else: #settings['rhombicity'] == 3: 
-      print('  - User-specified rhombic symmetry enforced') 
-    print('  - Collinearity cutoff of', str(settings['collinearity']), 
-              '('+str(10.0**(-settings['collinearity']))+')') 
-  print('- Spin Hamiltonian parameters') 
-  for i in range(spin_system.num): 
-    print('  - Spin center', str(i+1)+',', 'S =', str(spin_system.spins[i])) 
-    print('    g =', str(spin_system.g_vals[i])) 
-    print('    D =', str(spin_system.d_vals[i])) 
-  if spin_system.num > 1: 
-    if len(spin_system.j_vals) == 0: print('  - Scalar J coupling: None') 
-    else: 
-      print('  - Scalar J coupling:') 
-      for i in range(len(spin_system.j_vals)): 
-        x = 'J' +str(spin_system.jindex[i,0]+1) +str(spin_system.jindex[i,1]+1) 
-        print('    '+x, '=', str(spin_system.j_vals[i])) 
-    if len(spin_system.eeG_vals) == 0: 
-      print('  - Vector eeG coupling: None') 
-    else: 
-      print('  - Vector eeG coupling:') 
-      for i in range(len(spin_system.eeG_vals)): 
-        x = 'G' +str(spin_system.jindex[i,0]+1) +str(spin_system.jindex[i,1]+1) 
-        print('    '+x+'(r,theta,phi) =', str(spin_system.eeG_vals[i])) 
-      print('    WARNING: Verify integration domain is acceptible!') 
-    if len(spin_system.eeD_vals) == 0: 
-      print('  - Tensor eeD coupling: None') 
-    else: 
-      print('  - Tensor eeD coupling:') 
-      for i in range(len(spin_system.eeD_vals)): 
-        x = 'D' +str(spin_system.jindex[i,0]+1) +str(spin_system.jindex[i,1]+1) 
-        print('    '+x, '=', str(spin_system.eeD_vals[i])) 
-      print('    WARNING: Verify integration domain is acceptible!') 
-  if len(spin_system.var_names) > 0: 
-    print('- Fitting variables:') 
-    for i in range(len(spin_system.var_names)): 
-      print('  -',spin_system.var_names[i],'in', 
-            '['+', '.join([str(x) for x in spin_system.var_bounds[i]])+']') 
-  return [settings, spin_system, datasets] 
+    def write_file(self, filename=None) -> None:
+        """Writes a CSV file containing [T, H, Data, Error, Simulation, Data, Error, Simulation, ...]"""
+        if filename is None:
+            filename = self.output
+        num = self.num
+        header = ['Temp', 'Field', 'bH/2kT']
+        for i in range(num):
+            header.extend([f'Sim {i + 1}', f'Data {i + 1}', f'Error {i + 1}'])
+        output = np.transpose(self.tempfield)
+        # (Bohr mag)/(2kB) = 0.33585690476000785 Kelvin/Tesla
+        output = np.append(output, [0.33585690476000785 * output[1] / output[0]], axis=0)
+        for i in range(num):
+            if i < self.simulation.shape[0]:
+                output = np.append(output, self.simulation[np.newaxis, i], axis=0)
+            else:
+                output = np.append(output, np.zeros((1, len(self.tempfield))), axis=0)
+            if i < len(self.data):
+                output = np.append(output, self.data[np.newaxis, i], axis=0)
+                output = np.append(output, self.error[np.newaxis, i], axis=0)
+            else:
+                output = np.append(output, np.zeros((2, len(self.tempfield))), axis=0)
+        output = np.append([header], output.T, axis=0)
+        with open(filename, mode='w') as f:
+            writer = csv.writer(f, delimiter=',')
+            for r in output:
+                writer.writerow(r)
 
-""" raw_summary: summarize results from fit without statistical analysis """
-def raw_summary(spinsystem, datasets): 
-  print('\nSummary of fit, unprocessed:') 
-  if len(spinsystem.var_names) == 0: 
-    print('- No fitted variables') 
-  else: 
-    print('- Fitted variables:') 
-    for i in range(len(spinsystem.var_names)): 
-      print('  - Refined', spinsystem.var_names[i], 'to', 
-            str(spinsystem.vars[i])) 
-  print('- Weighted residual sum of squares:') 
-  for i in range(len(datasets)): 
-    for j in range(datasets[i].num): 
-      print('  - Dataset', str(i+1), 'transition', str(j+1), 
-            'with WRSS =', datasets[i].polarizations[j].wrss) 
-  print('- Spin Hamiltonian parameters:') 
-  glist   = resolve_variables(spinsystem.g_vals, spinsystem.g_vars, 
-                              spinsystem.vars) 
-  dlist   = resolve_variables(spinsystem.d_vals, spinsystem.d_vars, 
-                              spinsystem.vars) 
-  jlist   = resolve_variables(spinsystem.j_vals, spinsystem.j_vars, 
-                              spinsystem.vars) 
-  eeGlist = resolve_variables(spinsystem.eeG_vals, spinsystem.eeG_vars, 
-                              spinsystem.vars) 
-  eeDlist = resolve_variables(spinsystem.eeD_vals, spinsystem.eeD_vars, 
-                              spinsystem.vars) 
-  for i in range(spinsystem.num): 
-    print('  - Spin number', str(i+1)+',', 'S =', str(spinsystem.spins[i])) 
-    print('    g =', sf(glist[i])) 
-    print('    D =', sf(dlist[i])) 
-  if spin_system.num > 1: 
-    if len(jlist) == 0: print('  - Scalar J coupling: None') 
-    else: 
-      print('  - Scalar J coupling:') 
-      for i in range(len(jlist)): 
-        print('    J'+str(spin_system.jindex[i,0]+1)+str(spin_system.jindex[i,1]+1), 
-              '=', sf(jlist[i])) 
-    if len(eeGlist) == 0: print('  - Vector eeG coupling: None') 
-    else: 
-      print('  - Vector eeG coupling:') 
-      for i in range(len(eeGlist)): 
-        print('    G'+str(spin_system.jindex[i,0]+1)+str(spin_system.jindex[i,1]+1) 
-              +'(r,theta,phi) =', sf(eeGlist[i])) 
-    if len(eeDlist) == 0: print('  - Tensor eeD coupling: None') 
-    else: 
-      print('  - Tensor eeD coupling:') 
-      for i in range(len(eeDlist)): 
-        print('    D'+str(spin_system.jindex[i,0]+1)+str(spin_system.jindex[i,1]+1), 
-              '=', sf(eeDlist[i])) 
-  else: 
-    print('  - Single spin, so no exchange coupling') 
-  print('- Transition polarizations:') 
-  for i in range(len(datasets)): 
-    for j in range(datasets[i].num): 
-      pol = datasets[i].polarizations[j] 
-      conv = pol.transform 
-      if conv is None: 
-        print('  - Dataset', str(i+1), 'constrained transition', str(j+1), 
-              'polarized as') 
-        if len(pol.reg) == 3: 
-          print('      [Myz, Mzx, Mxy] =', sf(pol.reg)) 
-        else: 
-          raise_error('Improperly sized polarization,', str(pol.size)) 
-      else: 
-        # let's check if the transformation matrix is the identity matrix 
-        is_identity_mat = False 
-        if conv.shape[0] == conv.shape[1]: 
-          is_identity_mat = conv - np.eye(conv.shape[0]) 
-          is_identity_mat = np.dot(is_identity_mat, is_identity_mat.T) 
-          if np.trace(is_identity_mat) < 1e-6: 
-            is_identity_mat = True 
-          else: 
-            is_identity_mat = False 
-        if is_identity_mat: 
-          print('  - Dataset', str(i+1), 'transition', str(j+1), 
-                'polarized as') 
-          if len(pol.svd) == 3: 
-            print('      [Myz, Mzx, Mxy] =', sf(pol.svd)) 
-          else: 
-            raise_error('Improperly sized polarization,', str(pol.size)) 
-        else: 
-          polstr = ['M'+str(k+1)+' '+sf(pol.svd[k]) 
-                    for k in range(len(pol.svd))] 
-          print('  - Dataset', str(i+1), 'transition', str(j+1), 
-                'polarized as', ', '.join(polstr)) 
-          print_matrix_eq(conv, three_pol_mat, '=', 
-                          gen_pol_mat[:len(pol.svd)], indent=4) 
+    def _get_center(self, simulations, i):
+        """From a (Cartesian) list of simulations, takes the entry for the correct spin center and applies any
+        constraints it may find. Constraints should be stored as (n,3) or (n,9) ndarrays. For example,
+        - A constraints along the [1, 0, 0] vector is constraints[i] = np.array([[1, 0, 0]])
+        - A constraints within the xy (Myz/Mzx) plane is constraints[i] = np.array([[1, 0, 0], [0, 1, 0]])"""
+        if self.constraints[i] is not None:
+            return simulations[self.centers[i]] @ self.constraints[i].T
+        else:
+            return simulations[self.centers[i]]
 
-""" statistics_module: calculate (unweighted) covariance matrix and report 
-    (hopefully) useful statistics information to the user """
-def statistics_module(spinsystem, datasets): 
-  def get_covariance(spinsystem, datasets): 
-    if len(spinsystem.var_names) == 0: 
-      return np.array([]) 
-    epsilon = 0.01 # change if you'd like! 
-    displacements = epsilon * np.eye(len(spinsystem.var_names)) 
-    best_fit = np.array([x for dataset in datasets 
-                           for transition in dataset.sim 
-                           for x in transition]) # flat array of simulated vals 
-    vars = spinsystem.vars
-    jacobian = [[x for dataset in datasets 
-                   for transition in dataset.simulate(spinsystem, vars + disp) 
-                   for x in transition] for disp in displacements] 
-    jacobian = (1/epsilon)*np.array([x - best_fit for x in jacobian]) 
-    variance = np.sum([pol.rss for dataset in datasets 
-                               for pol in dataset.polarizations]) 
-    variance = variance / (len(best_fit)-len(spinsystem.var_names)) 
-    covariance = np.dot(jacobian, jacobian.T) 
-    covariance = variance * inv(covariance) 
-    return covariance 
-  
-  print('\nStatistical Module:') 
-  print('- Estimating error by numerical derivatives/Jacobian') 
-  names = spinsystem.var_names 
-  cov = get_covariance(spinsystem, datasets) 
-  if len(names) == 0: 
-    print('- No fitted variables') 
-  else: 
-    print('- Fitted variables:') 
-    print('  - Covariances, unweighted:') 
-    for v in range(len(names)): 
-      print('    - sigma^2['+names[v]+'] =', sf(cov[v,v])) 
-    for v in range(len(names)): 
-      for w in range(v+1, len(names)): 
-        print('    - sigma['+names[v]+','+names[w]+'] =', sf(cov[v,w])) 
-    print('  - Correlation coefficients, unweighted:') 
-    for v in range(len(names)): 
-      for w in range(v+1, len(names)): 
-        corr = cov[v,w]/np.sqrt(cov[v,v]*cov[w,w]) 
-        print('    - corr['+names[v]+','+names[w]+'] =', sf(corr)) 
-    print('  - Standard error of fit, unweighted:') 
-    for v in range(len(names)): 
-      num_err = cov[v,v] 
-      if not np.isnan(num_err): 
-        num_err = np.sqrt(num_err) 
-      num_err = number_error(spinsystem.vars[v], num_err) 
-      print('    - Variable', names[v], '=', num_err) 
-  for d, dataset in enumerate(datasets): 
-    print('- Polarizations for dataset', str(d+1), '('+dataset.infile+')') 
-    for p, pol in enumerate(dataset.polarizations): 
-      # let's check if the transformation matrix is the identity matrix 
-      conv = pol.transform 
-      is_identity_mat = False 
-      if conv.shape[0] == conv.shape[1]: 
-        is_identity_mat = conv - np.eye(conv.shape[0]) 
-        is_identity_mat = np.dot(is_identity_mat, is_identity_mat.T) 
-        if np.trace(is_identity_mat) < 1e-6: 
-          is_identity_mat = True 
-        else: 
-          is_identity_mat = False 
-      if is_identity_mat: 
-        pol_names = ['Myz', 'Mzx', 'Mxy'] 
-      else: 
-        pol_names = ['M1', 'M2', 'M3'][:len(pol.svd)] 
-      cov = pol.covariance 
-      print('  - Transition', str(p+1)+':') 
-      if len(pol.nsing) > 0: 
-        print('    - -Log10(Norm square sing vals):', 
-            '\n     ', sf(-np.log10(pol.nsing), sig=2)) 
-      print('    - Covariances, weighted:') 
-      for v in range(len(pol.svd)): 
-        print('      - sigma^2['+pol_names[v]+'] =', sf(cov[v,v])) 
-      for v in range(len(pol.svd)): 
-        for w in range(v+1,len(pol.svd)): 
-          print('      - sigma['+pol_names[v]+',' 
-                +pol_names[w]+'] =', sf(cov[v,w])) 
-      print('    - Correlation coefficients, weighted:') 
-      for v in range(len(pol.svd)): 
-        for w in range(v+1,len(pol.svd)): 
-          corr = cov[v,w]/np.sqrt(cov[v,v]*cov[w,w]) 
-          print('      - corr['+pol_names[v]+','+pol_names[w]+'] =', sf(corr)) 
-      print('    - Standard error of the fit, weighted:') 
-      for v in range(len(pol.svd)): 
-        num_err = cov[v,v] 
-        if not np.isnan(num_err): 
-          num_err = np.sqrt(num_err) 
-        num_err = number_error(pol.svd[v], num_err) 
-        print('      '+pol_names[v], '=', num_err) 
-  return True 
+    def _fit_subroutine(self, simulations, transition, cutoff):
+        """Uses weighted linear regression to get closest match to data. In weighted linear regression, the coefficients
+        of best fit (c) relating the X matrix to the y vector can be found by c = (X.T W X)^-1 X.T W y using weight
+        matrix W. Doing this directly here instead of relying on numpy's built-in regression wrapper should (?) make the
+        routine slightly faster."""
+        b_offset = np.zeros(len(self.tempfield))
+        weight = self._weights[transition]
+        x = self._get_center(simulations, transition)
+        if self.b_term[transition]:
+            if isinstance(self.b_term[transition], numeric):
+                b_offset = self.b_term[transition] * self.tempfield[:, 1]
+            elif self.b_term[transition] == 'fit':
+                x = np.hstack((x, self.tempfield[:, [1]]))
+            else:
+                raise RuntimeError(f'Unrecognized B-term parameter {self.b_term[transition]}')
+        y = self.data[transition] - b_offset
+        x, transform = reduce_dimension(x, weight, y, cutoff)  # set cutoff to 0 to skip svd
+        params = x.T * weight
+        params = np.linalg.inv(params @ x) @ params @ y  # best fit parameters
+        return Simulation(x @ params + b_offset, x, params, transform)
 
-""" Here we go, the main program """ 
-if __name__ == "__main__": 
-  print('MCD Simulation and Fitting with Particle Swarm Optimization') 
-  print('Version 0.4, Wesley J. Transue\n') 
-  
-  start_time = time.time() 
-  [settings, spin_system, datasets] = read_yaml(sys.argv[1]) 
-  
-  print('\nBeginning job...', flush=True)
-  if settings['type'] == 'fit': 
-    # if there are variables to be fit, do so then update spin_system 
-    if len(spin_system.var_names) > 0: 
-      cost, pos = particle_swarm_fit(spin_system, datasets, settings) 
-      spin_system.set_vars(pos) 
-    # fit polarizations for each data set, possibly with SVD reduction 
-    for dataset in datasets: 
-      dataset.update_by_svd(spin_system, rhombicity=settings['rhombicity']) 
-  for dataset in datasets: 
-    dataset.sim = dataset.simulate(spin_system) 
-    dataset.write_datafile(settings['type'])
-  if settings['type'] == 'fit': 
-    raw_summary(spin_system, datasets) 
-    if settings['statistics']: 
-      statistics_module(spin_system, datasets) 
-  
-  express_duration(start_time) 
+    def fit_to(self,
+               spin_system: SpinSystem,
+               variable_values: np.ndarray,
+               integration_grid: IntegrationGrid,
+               cutoff) -> list:
+        # First we simulate by integration, transposing so that it is formatted as [center, T/H index, intensity]
+        simulations = np.array([integrate(temperature, field, spin_system, variable_values, integration_grid)
+                                for temperature, field in self.tempfield]).transpose((1, 0, 2))
+        return [self._fit_subroutine(simulations, i, cutoff) for i in range(self.data.shape[0])]
+
+    def residuals(self,
+                  spin_system: SpinSystem,
+                  variable_values: np.ndarray,
+                  integration_grid: IntegrationGrid,
+                  cutoff) -> np.ndarray:
+        data_simulations = self.fit_to(spin_system, variable_values, integration_grid, cutoff)
+        return np.array([sim.fitted for sim in data_simulations]) - self.data
+
+    def quick_wrss(self,
+                   spin_system: SpinSystem,
+                   variable_values: np.ndarray,
+                   integration_grid: IntegrationGrid,
+                   cutoff, adjust=True) -> float:
+        data_simulations = self.fit_to(spin_system, variable_values, integration_grid, cutoff)
+        residuals_vectors = np.array([sim.fitted for sim in data_simulations]) - self.data
+        wrss = 0
+        for k in range(len(residuals_vectors)):
+            scale = data_simulations[k].adjustment if adjust else 1  # try to decrease bias
+            wrss += scale * (residuals_vectors[k] * self._weights[k]) @ residuals_vectors[k]
+        return wrss
+
+    def get_reduced_polarizations(self,
+                                  spin_system: SpinSystem,
+                                  variable_values: np.ndarray,
+                                  integration_grid: IntegrationGrid,
+                                  cutoff) -> list:
+        """Same routine as `fit_to' but returns the polarizations and transformation matrices."""
+        # First we simulate by integration, transposing so that it is formatted as [center, T/H index, intensity]
+        data_simulations = self.fit_to(spin_system, variable_values, integration_grid, cutoff)
+        return [[sim.parameters, sim.transform] for sim in data_simulations]
+
+    def get_reduced_polarization_derivatives(self,
+                                             spin_system: SpinSystem,
+                                             variable_values: np.ndarray,
+                                             integration_grid: IntegrationGrid,
+                                             cutoff):
+        data_simulations = self.fit_to(spin_system, variable_values, integration_grid, cutoff)
+        return block_diag(*[sim.simulations for sim in data_simulations])
+
+    def calculate_given(self, variable_values: np.ndarray = None):
+        """Uses self.polarizations to simulate data for each transition."""
+        if variable_values is None:
+            variable_values = []
+        # First we simulate by integration, transposing so that it is formatted as [center, T/H index, intensity]
+        self.cartesian = np.array([integrate(temperature, field,
+                                             self.spin_system, variable_values, self.integration_grid)
+                                   for temperature, field in self.tempfield]).transpose((1, 0, 2))
+        self.simulation = np.zeros((len(self.polarizations), len(self.tempfield)))
+        for i in range(len(self.polarizations)):
+            self.simulation[i] = self.cartesian[self.centers[i]] @ self.polarizations[i]
+            if self.b_term[i]:
+                if isinstance(self.b_term[i], numeric):  # if we're given B term, subtract from data
+                    self.simulation[i] += self.b_term[i] * self.tempfield[:, 1]
+                else:
+                    raise TypeError(f'B term must be numeric for simulations')
+
+    def calculate_by_fit(self, variable_values: np.ndarray = None, update=True):
+        """Uses weighted linear regression to calculate the WRSS, polarizations, and simulated data for each transition
+        in self.data. Updates self to retain simulated data and reduced polarization info."""
+        if variable_values is None:
+            variable_values = []
+        # First we simulate by integration, transposing so that it is formatted as [center, T/H index, intensity]
+        cartesian = np.array([integrate(temperature, field, self.spin_system, variable_values, self.integration_grid)
+                              for temperature, field in self.tempfield]).transpose((1, 0, 2))
+        svd_reduced = []
+        svd_transform = []
+        svd_polarizations = []
+        simulation = np.zeros(self.data.shape)
+        wrss = np.zeros(self.data.shape[0])
+        for i, y in enumerate(self.data):
+            weight = self._weights[i]  # read in weights for the data points
+            x = self._get_center(cartesian, i)  # simulation for correct center, constrained if necessary
+            if self.b_term[i]:
+                if self.b_term[i] == 'fit':  # if we're fitting B term, add to `sim` variable before SVD
+                    x = np.hstack((x, self.tempfield[:, [1]]))
+                elif isinstance(self.b_term[i], numeric):  # if we're given B term, subtract from data
+                    y = y - self.b_term[i] * self.tempfield[:, 1]
+            x, transform = reduce_dimension(x, weight, y, self.cutoff)
+            params = x.T * weight
+            params = np.linalg.inv(params @ x) @ params @ y  # best fit parameters `b`
+            svd_reduced.append(x)
+            svd_transform.append(transform)
+            svd_polarizations.append(params)  # Cartesian by pinv(transform) @ params)
+            simulation[i] = x @ params
+            wrss[i] = sum((y - x @ params) ** 2 * weight)
+        if update:
+            self.cartesian = cartesian
+            self.svd_reduced = svd_reduced
+            self.svd_transform = svd_transform
+            self.svd_polarizations = svd_polarizations
+            self.simulation = simulation
+            self.wrss = wrss
+        return wrss
+
+    def perturb_svd_pol_wrss(self, perturbation):
+        def add(list1, list2):
+            if isinstance(list1, (int, float)):
+                return list1 + list2
+            else:
+                return [add(*i) for i in zip(list1, list2)]
+
+        polarizations = add(self.polarizations, perturbation)
+        wrss = np.zeros(self.data.shape[0])
+        for i, y in enumerate(self.data):
+            weight = self._weights[i]  # read in weights for the data points
+            sim = self.svd_reduced[i]
+            params = polarizations[i]
+            if isinstance(self.b_term[i], numeric):
+                y = y - self.b_term[i] * self.tempfield[:, 1]
+            wrss[i] = sum((y - sim @ params) ** 2 * weight)
+        return wrss
+
+
+class DataCollection:
+    def __init__(self, list_of_datasets=None):
+        if list_of_datasets is None:
+            list_of_datasets = []
+        self.datasets = list_of_datasets
+        self._split, self._split_lengths, self._split_directory = None, None, None
+
+    def __len__(self):
+        return len(self.datasets)
+
+    def __iter__(self):
+        return iter(self.datasets)
+
+    def get_costs(self, spin_system, variable_values, integration_grid, cutoff, together=True, adjust=True):
+        if together:
+            return sum(dataset.quick_wrss(spin_system, variable_values, integration_grid, cutoff, adjust=adjust)
+                       for dataset in self.datasets)
+        else:
+            return [dataset.quick_wrss(spin_system, variable_values, integration_grid, cutoff, adjust=adjust)
+                    for dataset in self.datasets]
+
+    def get_residuals(self, spin_system, variable_values, integration_grid, cutoff):
+        return np.concatenate([np.concatenate(dataset.residuals(spin_system, variable_values, integration_grid, cutoff))
+                               for dataset in self.datasets])
+
+
+class VariableSystem:
+    def __init__(self, g_tensor=None, d_tensor=None, exchange_j=None,
+                 exchange_g=None, exchange_d=None):
+        def to_lambda_expr(expr):
+            if isinstance(expr, (list, tuple, np.ndarray)):
+                return [to_lambda_expr(item) for item in expr]
+            return 'lambda ' + ', '.join(self.names) + ': ' + str(expr)
+
+        if g_tensor is None:
+            g_tensor = []
+        if d_tensor is None:
+            d_tensor = []
+        if exchange_j is None:
+            exchange_j = []
+        if exchange_g is None:
+            exchange_g = []
+        if exchange_d is None:
+            exchange_d = []
+        self.inputs = {'g_tensor': g_tensor,
+                       'd_tensor': d_tensor,
+                       'exchange_j': exchange_j,
+                       'exchange_g': exchange_g,
+                       'exchange_d': exchange_d}
+        self.names = []
+        self.names.extend([var for var in find_variables(g_tensor) if var not in self.names])
+        self.names.extend([var for var in find_variables(d_tensor) if var not in self.names])
+        self.names.extend([var for var in find_variables(exchange_j) if var not in self.names])
+        self.names.extend([var for var in find_variables(exchange_g) if var not in self.names])
+        self.names.extend([var for var in find_variables(exchange_d) if var not in self.names])
+        self.bounds = []
+        self.values = []
+        self.g_tensor = to_lambda_expr(g_tensor)
+        self.d_tensor = to_lambda_expr(d_tensor)
+        self.exchange_j = to_lambda_expr(exchange_j)
+        self.exchange_g = to_lambda_expr(exchange_g)
+        self.exchange_d = to_lambda_expr(exchange_d)
+
+    def __len__(self):
+        return len(self.names)
+
+    def __iter__(self):
+        yield from self.names
+
+    def set_bounds(self, bounds):
+        self.bounds = [np.sort(bounds[name]) for name in self.names]
+
+    def set_values(self, values):
+        if len(values) != len(self.names):
+            raise ValueError('Improper number of variable values to set')
+        self.values = list(values)
+
+    def resolve(self, vals=None):
+        def from_lambda_expr(expr):
+            if isinstance(expr, list):
+                return [from_lambda_expr(item) for item in expr]
+            sin, cos, tan, exp = np.sin, np.cos, np.tan, np.exp  # hopefully this allows users to use these in eval()
+            func = eval(expr)
+            return func(*values)
+
+        values = vals if vals is not None else list(self.values)
+        if len(values) != len(self.names):
+            raise RuntimeError('Variable number mismatch')
+        return [from_lambda_expr(self.g_tensor),
+                from_lambda_expr(self.d_tensor),
+                from_lambda_expr(self.exchange_j),
+                from_lambda_expr(self.exchange_g),
+                from_lambda_expr(self.exchange_d)]
+
+
+def cost_at_each_particle(particle_positions, spin_system, variable_system, integration_grid,
+                          data_collection, cutoff):
+    return [data_collection.get_costs(spin_system, variable_system.resolve(position),
+                                      integration_grid, cutoff, together=True)
+            for position in particle_positions]
+
+
+class FitSystem:
+    """Performs fitting of the magnetic parameters"""
+
+    def __init__(self, spin_system: SpinSystem, variable_system: VariableSystem,
+                 integration_grid: IntegrationGrid, data_collection: DataCollection, settings: dict) -> None:
+        """Initializes the FitSystem object"""
+        self.spin_system = spin_system
+        self.variable_system = variable_system
+        self.integration_grid = integration_grid
+        self.data_collection = data_collection
+        self._split_collection = None
+        self.settings = settings
+        self.cost = []
+        self.history = []
+
+    def fit_no_variables(self):
+        self.cost = self.data_collection.get_costs(self.spin_system, self.variable_system.resolve(),
+                                                   self.integration_grid, cutoff=settings['cutoff'],
+                                                   together=False, adjust=False)
+
+    def particle_swarm_fit(self) -> float:
+        """Perform particle swarm optimization. We will also hijack the Pyswarms `_populate_history` function to
+        record the current cost at each step. For some reason, this is not built-in; it only records the current best
+        at each step."""
+
+        def wrapper(populate_history):
+            def _wrap(self, hist):
+                if not hasattr(self, 'current_cost_history'):
+                    self.current_cost_history = []
+                self.current_cost_history.append(self.swarm.current_cost)
+                populate_history(self, hist)
+
+            return _wrap
+
+        ps.base.base_single.SwarmOptimizer._populate_history = wrapper(
+            ps.base.base_single.SwarmOptimizer._populate_history)
+        settings = self.settings
+        options = {'c1': settings['cognitive'], 'c2': settings['social'], 'w': settings['inertial']}
+        bounds = np.array(self.variable_system.bounds).T
+        if settings['parallel'] is not None and settings['parallel'] < 2:
+            settings['parallel'] = None
+        optimizer = ps.single.GlobalBestPSO(n_particles=settings['particles'],
+                                            dimensions=len(self.variable_system),
+                                            options=options, bounds=bounds)
+        cost, pos = optimizer.optimize(cost_at_each_particle,
+                                       iters=settings['iterations'],
+                                       n_processes=settings['parallel'],
+                                       spin_system=self.spin_system,
+                                       variable_system=self.variable_system,
+                                       integration_grid=self.integration_grid,
+                                       data_collection=self.data_collection,
+                                       cutoff=settings['cutoff'])
+        self.history = [np.array(optimizer.cost_history),
+                        np.array(optimizer.current_cost_history),
+                        np.array(optimizer.pos_history),
+                        np.array(optimizer.velocity_history)]
+        if settings['history']:
+            with open(settings['history'] + '.cost.csv', mode='w') as f:
+                writer = csv.writer(f, delimiter=',')
+                writer.writerow([f'Particle {n + 1}' for n in range(settings['particles'])])
+                for r in self.history[1]:
+                    writer.writerow(r)
+            with open(settings['history'] + '.position.csv', mode='w') as f:
+                writer = csv.writer(f, delimiter=',')
+                writer.writerow([f'Particle {n + 1} {variable}' for n in range(settings['particles'])
+                                 for variable in self.variable_system])
+                for r in self.history[2]:
+                    writer.writerow(r.flatten())
+            with open(settings['history'] + '.velocity.csv', mode='w') as f:
+                writer = csv.writer(f, delimiter=',')
+                writer.writerow([f'Particle {n + 1} {variable}' for n in range(settings['particles'])
+                                 for variable in self.variable_system])
+                for r in self.history[3]:
+                    writer.writerow(r.flatten())
+        self.cost = self.data_collection.get_costs(self.spin_system, self.variable_system.resolve(pos),
+                                                   self.integration_grid, cutoff=settings['cutoff'],
+                                                   together=False, adjust=False)
+        self.variable_system.set_values(pos)
+        self.spin_system.set_parameters(*self.variable_system.resolve())
+        return cost
+
+    def hooke_and_jeeves_fit(self) -> float:
+        """Perform Hooke & Jeeves optimization"""
+        settings = self.settings
+        bounds = np.array(self.variable_system.bounds).T
+        if settings['parallel'] is not None and settings['parallel'] < 2:
+            settings['parallel'] = None
+        optimizer = HookeAndJeeves(start=self.variable_system.values,
+                                   bounds=bounds,
+                                   rho=settings['rho'],
+                                   eps=settings['eps'],
+                                   itermax=settings['iterations'])
+        covariance = self.covariance_matrix()
+        cost, pos = optimizer.optimize(cost_at_each_particle, covariance,
+                                       n_processes=settings['parallel'],
+                                       spin_system=self.spin_system,
+                                       variable_system=self.variable_system,
+                                       integration_grid=self.integration_grid,
+                                       data_collection=self.data_collection,
+                                       cutoff=settings['cutoff'])
+        self.cost = self.data_collection.get_costs(self.spin_system, self.variable_system.resolve(pos),
+                                                   self.integration_grid, cutoff=settings['cutoff'],
+                                                   together=False, adjust=False)
+        self.variable_system.set_values(pos)
+        self.spin_system.set_parameters(*self.variable_system.resolve())
+        return cost
+
+    def grid_search_fit(self) -> float:
+        """Perform Grid Search optimization"""
+        settings = self.settings
+        bounds = np.array(self.variable_system.bounds).T
+        if settings['parallel'] is not None and settings['parallel'] < 2:
+            settings['parallel'] = None
+        optimizer = GridSearch(settings['divisions'], bounds, settings['start'])
+        cost, pos = optimizer.optimize(cost_at_each_particle,
+                                       n_processes=settings['parallel'],
+                                       spin_system=self.spin_system,
+                                       variable_system=self.variable_system,
+                                       integration_grid=self.integration_grid,
+                                       data_collection=self.data_collection,
+                                       cutoff=settings['cutoff'])
+        self.cost = self.data_collection.get_costs(self.spin_system, self.variable_system.resolve(pos),
+                                                   self.integration_grid, cutoff=settings['cutoff'],
+                                                   together=False, adjust=False)
+        self.variable_system.set_values(pos)
+        self.spin_system.set_parameters(*self.variable_system.resolve())
+        return cost
+
+    def polarization_info(self):
+        return [dataset.get_reduced_polarizations(self.spin_system,
+                                                  self.variable_system.resolve(),
+                                                  self.integration_grid,
+                                                  self.settings['cutoff'])
+                for dataset in self.data_collection]
+
+    def covariance_matrix(self, epsilon=0.01, include_polarizations=True):
+        # Weighted covariance matrix:
+        # cov = (res @ weight @ res) / (n - p) * inv(jacob.T @ weight @ jacob)
+        # cov is covariance matrix of fitted parameters
+        # res is a vector of residuals
+        # weight is a weight matrix equal to inverse of data covariance matrix
+        # jacob is a Jacobian matrix of predicted data vs parameter variable
+        best_fit = np.array(self.data_collection.get_residuals(self.spin_system,
+                                                               self.variable_system.resolve(),
+                                                               self.integration_grid,
+                                                               self.settings['cutoff']))
+        if len(self.variable_system.values) > 0:
+            position = self.variable_system.values
+            displacements = epsilon * np.eye(len(self.variable_system))
+            jacobian = [self.data_collection.get_residuals(self.spin_system,
+                                                           self.variable_system.resolve(position + disp),
+                                                           self.integration_grid,
+                                                           self.settings['cutoff'])
+                        for disp in displacements]
+            jacobian = np.array([sim - best_fit for sim in jacobian]) / epsilon
+        else:
+            jacobian = np.zeros((0, len(best_fit)))
+        if include_polarizations:
+            pol_derivs = block_diag(*[dataset.get_reduced_polarization_derivatives(self.spin_system,
+                                                                                   self.variable_system.resolve(),
+                                                                                   self.integration_grid,
+                                                                                   self.settings['cutoff'])
+                                      for dataset in self.data_collection]).T
+            jacobian = np.concatenate((jacobian, pol_derivs))
+        weights = flatten_shape([flatten_shape(dataset.weights) for dataset in self.data_collection.datasets])
+        covariance = (jacobian * weights) @ jacobian.T
+        try:
+            covariance = np.linalg.inv(covariance)
+        except np.linalg.LinAlgError:
+            print('WARNING: Non-invertible matrix encountered while calculating (co)variance matrix...')
+            print('         Switching to Moore-Penrose pseudoinverse; however, results may be meaningless')
+            covariance = np.linalg.pinv(covariance)
+        covariance *= ((best_fit * weights) @ best_fit) / (len(weights) - len(self.variable_system))
+        return covariance
+
+
+def read_spin_system(yaml, run_type, settings) -> (SpinSystem, VariableSystem):
+    def check_shape(mat, shapes):
+        # a g tensor can have shapes [1, 2, 3, 6], D tensor [0, 1, 2, 5], exchange G [0, 3], exchange D [0, 1, 2, 5]
+        if isinstance(mat, list) and len(mat) in shapes:
+            return all(isinstance(x, numeric) or isinstance(x, str) for x in mat)
+        return False
+
+    fit_type = settings['algorithm']
+    print('Parsing \'spin_system\' and \'exchange\' blocks...')
+    yaml_spin, yaml_exch = yaml.get('spin_system'), yaml.get('exchange', dict())
+    if yaml_spin is None:
+        raise RuntimeError('No \'spin_system\' list found')
+    elif not isinstance(yaml_spin, list):
+        raise TypeError('Check hyphenation of \'spin_system\' list; a list was expected but a '
+                        f'{type(yaml_spin)} was found')
+    elif not all(isinstance(x, dict) for x in yaml_spin):
+        raise ValueError('Trouble interpreting \'spin_system\' list')
+    spins = [fraction_to_float(x.get('S', 0)) for x in yaml_spin]
+    if any(x <= 0 for x in spins):
+        raise ValueError('All spins must have \'S\' > 0')
+    elif not all(s > 0 and (2 * s) % 1 == 0 for s in spins):
+        raise ValueError(f'Inappropriate spin value found in {spins}')
+    spin_system = SpinSystem(spins)
+    g_tensor = []
+    for x in yaml_spin:
+        val = x.get('g', 2.0023)
+        if isinstance(val, numeric) or isinstance(val, str):
+            val = [val]
+        if not isinstance(val, list):
+            raise TypeError(f'Non-list g tensor error caused by {val}, which is a {type(val)}')
+        if not check_shape(val, [1, 2, 3, 6]):
+            raise ValueError(f'Uninterpretable g tensor {val}')
+        g_tensor.append(val)
+    d_tensor = []
+    for x in yaml_spin:
+        val = x.get('D', [])
+        if isinstance(val, numeric) or isinstance(val, str):
+            val = [val]
+        if not isinstance(val, list):
+            raise ValueError(f'Non-list D tensor error caused by {val}, which is a {type(val)}')
+        if not check_shape(val, [0, 1, 2, 3, 5, 6]):
+            raise ValueError(f'Uninterpretable D tensor {val}')
+        d_tensor.append(val)
+    if spin_system.nspins == 1:
+        if len(yaml_exch) != 0:
+            raise RuntimeError('Single spin systems should not have exchange')
+        exchange_j, exchange_g, exchange_d, j_factor = [[], [], [], -2]
+    else:
+        pairs = int(spin_system.nspins * (spin_system.nspins - 1) / 2)
+        if isinstance(yaml_exch, numeric) or isinstance(yaml_exch, (str, list)):
+            yaml_exch = {'scalar': yaml_exch}
+        if yaml_exch.get('isotropic') is not None and yaml_exch.get('scalar') is not None:
+            raise RuntimeError('Cannot specify both \'scalar\' and \'isotropic\' exchange coupling')
+        if yaml_exch.get('antisymmetric') is not None and yaml_exch.get('vector') is not None:
+            raise RuntimeError('Cannot specify both \'antisymmetric\' and \'vector\' exchange coupling')
+        if yaml_exch.get('anisotropic') is not None and yaml_exch.get('tensor') is not None:
+            raise RuntimeError('Cannot specify both \'anisotropic\' and \'tensor\' exchange coupling')
+        if yaml_exch.get('isotropic') is not None:
+            yaml_exch['scalar'] = yaml_exch['isotropic']
+        if yaml_exch.get('antisymmetric') is not None:
+            yaml_exch['vector'] = yaml_exch['antisymmetric']
+        if yaml_exch.get('anisotropic') is not None:
+            yaml_exch['tensor'] = yaml_exch['anisotropic']
+        exchange_j = yaml_exch.get('scalar', [])
+        exchange_g = yaml_exch.get('vector', [])
+        exchange_d = yaml_exch.get('tensor', [])
+        j_factor = yaml_exch.get('factor', -2)
+        if not isinstance(j_factor, numeric):
+            raise ValueError('J factor must be numeric')
+        if not isinstance(exchange_j, list):
+            exchange_j = [exchange_j]
+        if not check_shape(exchange_j, [0, pairs]):
+            raise RuntimeError(f'Exchange lists must have 0 or {pairs} entries and numeric/variable entries but the '
+                               f'scalar coupling list was {exchange_j}')
+        if not isinstance(exchange_g, list):
+            raise TypeError(f'List expected in vector exchange {exchange_g}')
+        if check_shape(exchange_g, [3]):
+            exchange_g = [exchange_g]
+        if len(exchange_g) not in [0, pairs]:
+            raise RuntimeError(f'Exchange lists must have 0 or {pairs} entries '
+                               f'but {exchange_g} has {len(exchange_g)}')
+        if not all(check_shape(x, [0, 3]) for x in exchange_g):
+            raise ValueError(f'Uninterpretable entry in vector exchange list {exchange_g}')
+        if not isinstance(exchange_d, list):
+            raise TypeError(f'List expected in tensor exchange {exchange_d}')
+        if check_shape(exchange_d, [1, 2, 3, 5, 6]):
+            exchange_d = [exchange_d]
+        if len(exchange_d) not in [0, pairs]:
+            raise RuntimeError(f'Exchange lists must have 0 or {pairs} entries; check tensor list')
+        if not all(check_shape(x, [0, 1, 2, 3, 5, 6]) for x in exchange_d):
+            raise ValueError(f'Uninterpretable entry in tensor exchange list {exchange_d}')
+    variable_system = VariableSystem(g_tensor, d_tensor, exchange_j, exchange_g, exchange_d)
+    if len(variable_system) > 0:
+        if run_type == 'simulation':
+            raise RuntimeError('Floating variables only allowed in fitting')
+        print(f'Located variables: {", ".join(variable_system.names)}')
+        bounds = {name: yaml['variables'][name][:2] for name in variable_system.names}
+        if fit_type == 'hj':
+            start_point = [yaml['variables'][name][2] for name in variable_system.names]
+        else:
+            start_point = [(x + y) / 2 for x, y in [bounds[name] for name in variable_system.names]]
+        if fit_type == 'grid':
+            d = []
+            for name in variable_system.names:
+                if len(yaml['variables'][name]) == 3:
+                    d.append(yaml['variables'][name][2])
+                else:
+                    d.append(settings['divisions'])
+            settings['divisions'] = d
+        variable_system.set_values(start_point)
+        variable_system.set_bounds(bounds)
+        spin_system.set_parameters(*variable_system.resolve(start_point), j_factor=j_factor)
+    else:
+        spin_system.set_parameters(g_tensor, d_tensor, exchange_j, exchange_g, exchange_d, j_factor)
+    return spin_system, variable_system, settings
+
+
+def read_integration(yaml, spin_system) -> IntegrationGrid:
+    print('Parsing \'integration\' block...')
+    yaml_integ = yaml.get('integration', {})
+    if not isinstance(yaml_integ, dict):
+        raise TypeError(f'Improperly formatted \'integration\' block; received {type(yaml_integ)} instead of dict. '
+                        'Remove any hyphenation')
+    method = lower(yaml_integ.get('method', 'lebedev'))
+    if method not in ['lebedev', 'gaussian', 'custom']:
+        raise ValueError(f'Unrecognized or unimplemented integration method {method}')
+    precision = lower(yaml_integ.get('precision', 'auto'))
+    if precision == 'auto':
+        precision = {'lebedev': 19, 'gaussian': 5, 'custom': 0}[method]
+    if method == 'lebedev':
+        if not isinstance(precision, int):
+            raise TypeError(f'Lebedev precision must be an integer but {precision} is a {type(precision)}')
+    if method == 'gaussian':
+        if not isinstance(precision, (int, list)):
+            raise TypeError(f'Gaussian precision must be an integer or list but {precision} is a {type(precision)}')
+    domain = lower(yaml_integ.get('domain'))
+    if method == 'custom':
+        if domain is None:
+            raise ValueError('A custom grid expects a filename in \'domain\' field')
+        if not isinstance(domain, str):
+            raise TypeError('A custom grid expects a string in \'domain\' field as a filename')
+        print(f'- Reading user-specified grid in \'{domain}\'')
+    else:
+        if domain is None:
+            domain = 'auto'
+        if domain not in ['sphere', 'hemi', 'hemisphere', 'octant', 'auto']:
+            raise ValueError('Unrecognized integration domain')
+    if domain == 'hemi':
+        domain = 'hemisphere'
+    if domain == 'auto':
+        domain = {'centrosymmetric': 'hemisphere', 'orthorhombic': 'octant',
+                  'axial': 'octant', 'isotropic': 'octant'}[spin_system.symmetry]
+    if spin_system.symmetry == 'centrosymmetric' and domain == 'octant':
+        print('WARNING: Octant domain likely inappropriate for this spin')
+        print('  Hamiltonian! Euler angles and/or antisymmetric exchange remove')
+        print('  orthorhombic symmetry such that `domain: hemisphere` should be used!')
+    return IntegrationGrid(method, precision, domain)
+
+
+def read_fit_settings(yaml, run_type) -> dict:
+    settings = {'type': run_type}
+    if run_type == 'fit':
+        print('Parsing \'fitting\' block...')
+        yaml_fit = yaml.get('fitting', dict())
+        if not isinstance(yaml_fit, dict):
+            raise TypeError(f'Uninterpretable \'fitting\' block; expected dict but got {type(yaml_fit)}')
+        cutoff = yaml_fit.get('svd')
+        c_degree = yaml_fit.get('dimension')
+        if cutoff is None and c_degree is None:
+            cutoff = 1e-4
+        elif cutoff is None and c_degree is not None:
+            if not isinstance(c_degree, int):
+                raise TypeError(f'\'dimension\' must be an integer but {c_degree} is a {type(c_degree)}')
+            if c_degree < 1:
+                raise ValueError(f'\'dimension\' must be positive but {c_degree} received')
+            cutoff = -c_degree
+        elif cutoff is not None and c_degree is None:
+            if not isinstance(cutoff, numeric):
+                raise TypeError(f'\'svd\' cutoff must be numeric but {cutoff} is a {type(cutoff)}')
+            if cutoff < 0:
+                raise ValueError(f'\'svd\' cutoff must be non-negative but {cutoff} received')
+            cutoff = abs(cutoff)
+        else:  # both are specified
+            raise RuntimeError('Cannot specify both \'svd\' cutoff and \'dimension\' size')
+        settings['algorithm'] = yaml_fit.get('algorithm', 'ps')
+        settings['cutoff'] = cutoff
+        settings['parallel'] = yaml_fit.get('parallel', 1)
+        settings['iterations'] = yaml_fit.get('iterations', 100)
+        settings['covariance'] = yaml_fit.get('covariance', None)
+        if settings['algorithm'] == 'ps':  # Particle Swarm is the default
+            settings['cognitive'] = yaml_fit.get('cognitive', 2.5)
+            settings['social'] = yaml_fit.get('social', 1.3)
+            settings['inertial'] = yaml_fit.get('inertial', 0.4)
+            settings['particles'] = yaml_fit.get('particles', 20)
+            settings['history'] = yaml_fit.get('history', False)
+            if not isinstance(settings['history'], bool):
+                raise TypeError(f'\'history\' must be boolean not {type(settings["history"])}')
+        elif settings['algorithm'] == 'hj':  # Hooke & Jeeves
+            settings['rho'] = yaml_fit.get('rho', 0.7)
+            settings['eps'] = yaml_fit.get('eps', 1.0e-8)
+        elif settings['algorithm'] == 'grid':  # Grid Search
+            settings['divisions'] = yaml_fit.get('divisions', 5)
+            settings['start'] = yaml_fit.get('start', 0)
+    else:  # 'simulation'
+        settings['algorithm'] = 'sim'
+        print('Skipping any \'fitting\' block... (simulation)')
+    return settings
+
+
+def read_data_files(yaml, run_type, integration_grid) -> DataCollection:
+    print('Parsing \'data\' block...')
+    yaml_data = yaml.get('data')
+    dim = 3 if integration_grid.domain == 'octant' else 9  # polarization dimension
+    if yaml_data is None:
+        raise RuntimeError('YAML file is missing \'data\' section')
+    if isinstance(yaml_data, dict):
+        raise TypeError('Datafiles must be provided as a list not a dict; double check hyphenation (-) is used')
+    if not isinstance(yaml_data, list):
+        raise TypeError(f'Datafiles must be provided as a list not a {type(yaml_data)}')
+    if not all(isinstance(x, dict) for x in yaml_data):
+        raise TypeError('Datafiles must be provided as a list of dict entries')
+    datasets = []
+    for i in range(len(yaml_data)):
+        infile = yaml_data[i].get('file')
+        if infile is None:
+            raise RuntimeError(f'File name missing for data file {i + 1}')
+        if not isinstance(infile, str):
+            raise RuntimeError(f'Non-string \'file\' name {infile} (type {type(infile)})')
+        outfile = yaml_data[i].get('out')
+        if outfile is None:
+            if infile[-4:].lower() == '.csv':
+                outfile = infile[:-4] + '.out' + infile[-4:]
+            else:
+                outfile = infile + '.out.csv'
+        else:
+            if not isinstance(outfile, str):
+                raise RuntimeError(f'Non-string \'out\' name {outfile} (type {type(outfile)})')
+        print(f'- Reading document {i + 1} \'{infile}\'')
+        dataset = Dataset(infile, outfile)
+        if run_type == 'fit':
+            number_of_transitions = dataset.data.shape[0]
+            if number_of_transitions == 0:
+                raise RuntimeError(f'No data found in file {infile}')
+            constraints = yaml_data[i].get('constraints', [None] * number_of_transitions)
+            if not isinstance(constraints, list):
+                raise TypeError('Polarization constraints must be supplied as an array but '
+                                f'{constraints} is of type {type(constraints)}')
+            if len(constraints) != number_of_transitions:
+                raise RuntimeError('Number of polarization constraints differs from number of transitions '
+                                   f'in file {infile}')
+            for j in range(number_of_transitions):
+                if constraints[j] is None:
+                    continue
+                elif isinstance(constraints[j], str) and lower(constraints[j]) == 'none':
+                    constraints[j] = None
+                elif isinstance(constraints[j], list):
+                    constraints[j] = np.array(constraints[j])
+                    if constraints[j].dtype == np.dtype('O'):
+                        raise TypeError(f'Confusing {ordinal(j + 1)} constraint {constraints[j]}')
+                    if len(constraints[j].shape) == 1:  # format [x, y, z] -> [[x, y, z]]
+                        constraints[j] = constraints[j][np.newaxis, :]
+                    if len(constraints[j].shape) > 2:
+                        raise ValueError(f'Confusing {ordinal(j + 1)} constraint {constraints[j]}')
+                    if constraints[j].shape[1] != dim:
+                        raise ValueError(f'Constraint supplied as a {constraints[j].shape[1]}-entry array but {dim} '
+                                         f'entries are expected with a(n) {integration_grid.domain} integration grid')
+                else:
+                    raise TypeError(f'Polarization constraints {constraints[j]} should be \'None\' or a list')
+            dataset.constraints = constraints
+            b_term = yaml_data[i].get('b_term', [None] * number_of_transitions)
+            if not isinstance(b_term, list):
+                b_term = [b_term]
+            if len(b_term) != number_of_transitions:
+                raise RuntimeError('Number of polarization B-term values differs from number of transitions '
+                                   f'in file {infile}')
+            for j in range(number_of_transitions):
+                if b_term[j] is None:
+                    continue
+                elif isinstance(b_term[j], numeric):
+                    if b_term[j] == 0:
+                        b_term[j] = None
+                elif isinstance(b_term[j], str):
+                    if lower(b_term[j]) == 'none':
+                        b_term[j] = None
+                    elif lower(b_term[j]) == 'fit':
+                        b_term[j] = 'fit'
+                    else:
+                        raise ValueError(f'Uninterpretable B-term specification: {b_term[j]}')
+                else:
+                    raise TypeError(f'Polarization B-term {b_term[j]} should be \'None\' or \'fit\' or a number')
+            dataset.b_term = b_term
+        else:  # 'simulation'
+            polarizations = yaml_data[i].get('polarizations')
+            if polarizations is None:
+                raise RuntimeError('Simulations require specification of polarizations')
+            if not isinstance(polarizations, list):
+                raise TypeError(f'Polarizations should be an array but are {type(polarizations)}')
+            if len(polarizations) == 0:
+                raise ValueError('Simulations require specification of polarizations')
+            polarizations = np.array(polarizations)
+            if len(polarizations.shape) == 1:
+                if polarizations.dtype == np.dtype('O'):
+                    raise TypeError(f'Improper polarization list {polarizations}')
+                polarizations = polarizations[np.newaxis, :]
+            if len(polarizations.shape) > 2:
+                raise ValueError(f'Polarization array deeper than expected for a simulation')
+            number_of_transitions = polarizations.shape[0]
+            if polarizations.shape[1] != dim:
+                raise ValueError(f'Polarizations supplied as a {polarizations.shape[1]}-entry array but {dim} '
+                                 f'entries are expected with a(n) {integration_grid.domain} integration grid')
+            dataset.polarizations = polarizations
+            b_term = yaml_data[i].get('b_term', [None] * number_of_transitions)
+            if not isinstance(b_term, list):
+                raise TypeError('Polarization B-term value must be supplied as an array but '
+                                f'{b_term} is of type {type(constraints)}')
+            if len(b_term) != number_of_transitions:
+                raise RuntimeError('Number of polarization B-term values differs from number of transitions '
+                                   f'in file {infile}')
+            for j in range(number_of_transitions):
+                if b_term[j] is None:
+                    continue
+                elif isinstance(b_term[j], numeric):
+                    continue
+                elif isinstance(b_term[j], str):
+                    if lower(b_term[j]) == 'none':
+                        b_term[j] = None
+                    else:
+                        raise ValueError(f'Uninterpretable B-term specification: {b_term[j]}')
+                else:
+                    raise TypeError(f'Polarization B-term {b_term[j]} should be \'None\' or or a number')
+            dataset.b_term = b_term
+        center_list = yaml_data[i].get('centers', [1] * number_of_transitions)
+        if isinstance(center_list, int):
+            center_list = [center_list]
+        if not isinstance(center_list, list):
+            raise TypeError(f'Centers are expected as a list but {center_list} is a {type(center_list)}')
+        if len(center_list) != number_of_transitions:
+            raise RuntimeError(f'Mismatch of {number_of_transitions} transitions found but only '
+                               f'{len(center_list)} centers specified')
+        dataset.centers = [x - 1 for x in center_list]  # Python counts from 0 but users will count from 1
+        datasets.append(dataset)
+    return DataCollection(datasets)
+
+
+def read_yaml(filename: str) -> (SpinSystem, VariableSystem, IntegrationGrid, DataCollection, dict):
+    with open(filename, 'r') as f:
+        yaml = safe_load(f)
+
+    run_type = {'sim': 'simulation', 'simulation': 'simulation',
+                'fit': 'fit', 'fitting': 'fit'}.get(lower(yaml.get('type')))
+    if run_type is None:
+        raise ValueError('Run type not specified or unrecognized; try \'fit\' or \'simulation\'')
+
+    settings = read_fit_settings(yaml, run_type)
+    spin_system, variable_system, settings = read_spin_system(yaml, run_type, settings)
+    integration_grid = read_integration(yaml, spin_system)
+    data_collection = read_data_files(yaml, run_type, integration_grid)
+
+    print('\nSummary of job:')
+    print('- Run type:', settings['type'])
+    print('- Data file(s):')
+    for i, dataset in enumerate(data_collection.datasets):
+        print(f'  {i + 1}) {dataset.filename} with {dataset.tempfield.shape[0]} point(s) and data for '
+              f'{dataset.data.shape[0]} transition(s)')
+        if dataset.header > 0:
+            print(f'    - Number of header lines skipped: {dataset.header}')
+        print(f'    - Output file \'{dataset.output}\'')
+        for j in range(len(dataset.centers)):
+            if settings['type'] == 'simulation':
+                if not dataset.b_term[j]:
+                    print(f'    - Transition {j + 1} on center {dataset.centers[j] + 1} polarized as',
+                          str(dataset.polarizations[j]))
+                else:
+                    print(f'    - Transition {j + 1} on center {dataset.centers[j] + 1}')
+                    print(f'      - Polarized as', str(dataset.polarizations[j]))
+                    print(f'      - Exhibiting B-term intensity of', str(dataset.b_term[j]), 'T^-1')
+            else:  # 'fit'
+                if dataset.constraints[j] is None:
+                    print(f'    - Transition {j + 1} on center {dataset.centers[j] + 1} unconstrained')
+                else:
+                    if dataset.constraints[j].shape[0] == 1:
+                        print(f'    - Transition {j + 1} on center {dataset.centers[j] + 1} constrained',
+                              'along vector of', str(dataset.constraints[j][0]))
+                    elif dataset.constraints[j].shape[0] == 2:
+                        print(f'    - Transition {j + 1} on center {dataset.centers[j] + 1} constrained',
+                              'within plane of', str(dataset.constraints[j][0]), 'and', str(dataset.constraints[j][1]))
+                    else:
+                        print(f'    - Transition {j + 1} on center {dataset.centers[j] + 1} constrained',
+                              'within hyperplane of', ', '.join(str(dataset.constraints[j][k])
+                                                                for k in range(dataset.constraints[j].shape[1])))
+                if dataset.b_term[j] == 'fit':
+                    print('      - Temperature-independent B-term intensity will be fitted')
+                elif dataset.b_term[j]:
+                    print('      - Temperature-independent B-term intensity set to', str(dataset.b_term[j]), 'T^-1')
+    print('- Numerical integration:')
+    print(f'  - Method: {integration_grid.method}')
+    if integration_grid.method != 'custom':
+        print(f'  - Precision: {integration_grid.precision} ({integration_grid.size} points)')
+        print(f'  - Domain: {integration_grid.domain}')
+    else:
+        print(f'  - Domain: user-specified from file {integration_grid.source}')
+    print('- Spin Hamiltonian')
+    for i in range(spin_system.nspins):
+        print(f'  - {ordinal(i + 1)} spin, S = {spin_to_fraction(spin_system.spins[i])}')
+        print(f'      g = [{", ".join(str(w) for w in variable_system.inputs["g_tensor"][i])}]')
+        print(f'      D = [{", ".join(str(w) for w in variable_system.inputs["d_tensor"][i])}]')
+    if spin_system.nspins > 1:
+        if len(variable_system.exchange_j) == 0:
+            print('  - Scalar (isotropic) J exchange coupling: None')
+        else:
+            if spin_system.j_factor >= 0:
+                print(f'  - Using a +{spin_system.j_factor}J term')
+            else:
+                print(f'  - Using a {spin_system.j_factor}J term')
+            print('  - Scalar (isotropic) J exchange coupling:')
+            for i in range(len(spin_system.jindices)):
+                print(f'      J{spin_system.jindices[i][0] + 1}{spin_system.jindices[i][1] + 1} =',
+                      str(variable_system.inputs['exchange_j'][i]))
+        if len(variable_system.exchange_g) == 0:
+            print('  - Vector (antisymmetric) G exchange coupling: None')
+        else:
+            print('  - Vector (antisymmetric) G exchange coupling:')
+            for i in range(len(spin_system.jindices)):
+                print(f'      G{spin_system.jindices[i][0] + 1}{spin_system.jindices[i][1] + 1} =',
+                      str(variable_system.inputs['exchange_g'][i]))
+        if len(variable_system.exchange_g) == 0:
+            print('  - Tensor (anisotropic) D exchange coupling: None')
+        else:
+            print('  - Tensor (anisotropic) D exchange coupling:')
+            for i in range(len(spin_system.jindices)):
+                print(f'      D{spin_system.jindices[i][0] + 1}{spin_system.jindices[i][1] + 1} =',
+                      str(variable_system.inputs['exchange_d'][i]))
+    if settings['type'] == 'fit':
+        print('- Fitting settings:')
+        if len(variable_system) > 0 and settings['algorithm'] == 'ps':
+            print('  - Fitting algorithm for variables: particle swarm')
+            print(f'  - Found {len(variable_system)} variable(s) to be fit:')
+            for i in range(len(variable_system)):
+                print(f'      {variable_system.names[i]} in [{", ".join(str(x) for x in variable_system.bounds[i])}]')
+            print('  - Cognitive/personal (c1) parameter:', settings['cognitive'])
+            print('  - Social/group (c2) parameter:', settings['social'])
+            print('  - Inertial (w) parameter:', settings['inertial'])
+            print('  -', settings['particles'], 'particles')
+            print('  -', settings['iterations'], 'iterations')
+            if settings['parallel'] > 1:
+                print('  -', settings['parallel'], 'parallel processes')
+            else:
+                print('  - Serial execution')
+            if settings['history']:
+                settings['history'] = filename[:-5] if filename[-5:] == '.yaml' else filename
+                print('  - Particle history will be written to\n'
+                      f'    - Particle costs in {settings["history"]}.cost.csv\n'
+                      f'    - Particle positions in {settings["history"]}.position.csv\n'
+                      f'    - Particle velocities in {settings["history"]}.velocity.csv')
+        elif len(variable_system) > 0 and settings['algorithm'] == 'hj':
+            print('  - Fitting algorithm for variables: Hooke & Jeeves')
+            print(f'  - Found {len(variable_system)} variable(s) to be fit:')
+            for i in range(len(variable_system)):
+                print(f'      {variable_system.names[i]} in [{", ".join(str(x) for x in variable_system.bounds[i])}]')
+            print('  - Scaling parameter (rho):', settings['rho'])
+            print('  - Convergence criterion (eps):', settings['eps'])
+            print('  - Maximum iterations:', settings['iterations'])
+            if settings['parallel'] > 1:
+                print('  -', settings['parallel'], 'parallel processes')
+            else:
+                print('  - Serial execution')
+        elif len(variable_system) > 0 and settings['algorithm'] == 'grid':
+            print('  - Fitting algorithm for variables: Grid Search')
+            print(f'  - Found {len(variable_system)} variable(s) to be fit:')
+            for i in range(len(variable_system)):
+                span = np.linspace(variable_system.bounds[i][0], variable_system.bounds[i][1],
+                                   settings['divisions'][i])
+                print(f'      {variable_system.names[i]} in [{", ".join(str(x) for x in span)}]')
+            if settings['parallel'] > 1:
+                print('  -', settings['parallel'], 'parallel processes')
+            else:
+                print('  - Serial execution')
+        else:
+            print('  - No variables require particle swarm fitting')
+        if settings['cutoff'] >= 0:
+            print('  - Dimensionality of C matrix by SVD, cutoff', str(settings['cutoff']))
+        else:
+            print('  - Dimensionality of C matrix set to', str(abs(settings['cutoff'])))
+    return spin_system, variable_system, integration_grid, data_collection, settings
+
+
+def report(fit_system: FitSystem):
+    print('\nSummary of fit:')
+    if len(fit_system.variable_system) == 0:
+        print('- No fitted variables')
+    else:
+        print('- Fitted variables:')
+        for n in range(len(fit_system.variable_system)):
+            print('  - Refined', fit_system.variable_system.names[n], 'to',
+                  str(fit_system.variable_system.values[n]))
+        print('- Spin Hamiltonian using fitted variables:')
+        g_tensor, d_tensor, exchange_j, exchange_g, exchange_d = fit_system.variable_system.resolve()
+        for i in range(fit_system.spin_system.nspins):
+            print(f'  - {ordinal(i + 1)} spin, S = {spin_to_fraction(fit_system.spin_system.spins[i])}')
+            print(f'      g = {g_tensor[i]}')
+            print(f'      D = {d_tensor[i]}')
+        if fit_system.spin_system.nspins > 1:
+            j_indices = fit_system.spin_system.jindices
+            if len(exchange_j) == 0:
+                print('  - Scalar (isotropic) J exchange coupling: None')
+            else:
+                if fit_system.spin_system.j_factor >= 0:
+                    print(f'  - Using a +{fit_system.spin_system.j_factor}J term')
+                else:
+                    print(f'  - Using a {fit_system.spin_system.j_factor}J term')
+                print('  - Scalar (isotropic) J exchange coupling:')
+                for i in range(len(j_indices)):
+                    print(f'      J{j_indices[i][0] + 1}{j_indices[i][1] + 1} =', str(exchange_j[i]))
+            if len(exchange_g) == 0:
+                print('  - Vector (antisymmetric) G exchange coupling: None')
+            else:
+                print('  - Vector (antisymmetric) G exchange coupling:')
+                for i in range(len(j_indices)):
+                    print(f'      G{j_indices[i][0] + 1}{j_indices[i][1] + 1} =', str(exchange_g[i]))
+            if len(exchange_d) == 0:
+                print('  - Tensor (anisotropic) D exchange coupling: None')
+            else:
+                print('  - Tensor (anisotropic) D exchange coupling:')
+                for i in range(len(j_indices)):
+                    print(f'      D{j_indices[i][0] + 1}{j_indices[i][1] + 1} =', str(exchange_d[i]))
+    print('- Weighted residual sum of squares:', sum(fit_system.cost))
+    if len(fit_system.cost) > 1:  # if we have multiple data sets, print individual costs
+        for n in range(len(fit_system.cost)):
+            print('  - Dataset', str(n + 1), 'with WRSS =', str(fit_system.cost[n]))
+
+    print('\nStatistical Analysis:')
+    print('- Estimating residual Jacobian matrix by numerical differentiation')
+    print('- Using reciprocal variance as weighting scheme')
+    n_vars = len(fit_system.variable_system)
+    covariance = fit_system.covariance_matrix()
+    if n_vars == 0:
+        print('- No fitted variables')
+    else:
+        print('- Fitted variables:')
+        print('  - (Co)variances, weighted:')
+        print_matrix_eq('cov(', [[name] for name in fit_system.variable_system.names], ') = ',
+                        covariance[:n_vars, :n_vars])
+        print('  - Correlation coefficients, weighted:')
+        corr = np.diag(np.diag(covariance[:n_vars, :n_vars]) ** -0.5)
+        corr = corr @ covariance[:n_vars, :n_vars] @ corr
+        print_matrix_eq('corr(', [[name] for name in fit_system.variable_system.names], ') = ', corr)
+        print('  - Standard error of the fit, weighted:')
+        for v in range(n_vars):
+            error = covariance[v, v]
+            if not np.isnan(error):
+                error = error ** 0.5
+            print(f'    - Variable {fit_system.variable_system.names[v]} =',
+                  f'{fit_system.variable_system.values[v]} +/- {error}')
+    all_transforms = [np.eye(n_vars)]
+    p_names, count = [], 0
+    p_info = fit_system.polarization_info()
+    for d, dataset in enumerate(fit_system.data_collection):
+        print(f'- Polarization info for dataset {d + 1} ({dataset.filename})')
+        pols = p_info[d]
+        for t in range(len(pols)):
+            if len(pols) > 1:
+                print(f'  - {ordinal(t + 1)} transition')
+            cartesian = [['Myz'], ['Mzx'], ['Mxy']]
+            params, transform = pols[t]
+            all_transforms.append(sorting_transform(transform))
+            sub_covariance = covariance[(n_vars + count):(n_vars + count + len(transform)),
+                                        (n_vars + count):(n_vars + count + len(transform))]
+            sub_covariance = all_transforms[-1] @ sub_covariance @ all_transforms[-1].T
+            # reduced @ transform = xdata and reduced @ params = ydata
+            # if reduced = xdata @ transform.T then xdata @ transform.T @ params = ydata
+            # so transform.T @ params = [Myz, Mzx, Mxy(, B)]
+            # or equivalently params = transform @ [Myz, Mzx, Mxy(, B)]
+            if dataset.b_term[t]:
+                if isinstance(dataset.b_term[t], numeric):
+                    print(f'  - Temperature-independent B term of {dataset.b_term[t]} T^-1')
+                if dataset.b_term[t] == 'fit':
+                    cartesian.append(['B'])
+            names = []
+            for p in params:
+                names.append('M' + str(count + 1))
+                count += 1
+            p_names.extend(names)
+            corr = np.diag(np.diag(sub_covariance) ** -0.5)
+            corr = corr @ sub_covariance @ corr
+            print_matrix_eq(all_transforms[-1] @ transform, ' * ', cartesian, ' = ',
+                            [[name] for name in names], ' = ',
+                            all_transforms[-1] @ params[:, np.newaxis], ' +/- ',
+                            np.diag(sub_covariance)[:, np.newaxis] ** 0.5)
+            print_matrix_eq('  corr(', [[name] for name in names], ') = ', corr)
+    if fit_system.settings['covariance'] is not None:
+        covariance_filename = fit_system.settings['covariance']
+        all_labels = list(fit_system.variable_system.names) + list(p_names)
+        with open(covariance_filename, mode='w') as f:
+            writer = csv.writer(f, delimiter=',')
+            writer.writerow(all_labels)
+            for r in covariance:
+                writer.writerow(r)
+
+
+if __name__ == '__main__':
+    print('MCD Simulation and Fitting with Particle Swarm Optimization\n'
+          'Version 0.7, Wesley J. Transue\n\n'
+          'Citation: Transue, W. J.; Solomon, E. I. Title. Journal 2022,\n'
+          'Vol (Issue), Pages. DOI: 10.XXXX/YYYYYY\n')
+    if len(sys.argv) != 2:
+        raise RuntimeError('Provide one YAML input file')
+
+    start_time = time()
+    spin_system, variable_system, integration_grid, data_collection, settings = read_yaml(sys.argv[1])
+
+    print('\nBeginning Job...', flush=True)
+    simulations = []
+    if settings['type'] == 'fit':
+        fit = FitSystem(spin_system, variable_system, integration_grid, data_collection, settings)
+        if fit.variable_system:  # if there are variables to be fit, deploy particle swarm
+            if settings['algorithm'] == 'ps':
+                fit.particle_swarm_fit()
+                print('Particle swarm variable optimization finished')
+            elif settings['algorithm'] == 'hj':
+                fit.hooke_and_jeeves_fit()
+                print('Hooke and Jeeves optimization finished')
+            elif settings['algorithm'] == 'grid':
+                fit.grid_search_fit()
+                print('Grid Search optimization finished')
+        else:
+            fit.fit_no_variables()
+        for dataset in fit.data_collection:
+            dataset.spin_system = fit.spin_system
+            dataset.integration_grid = fit.integration_grid
+            dataset.cutoff = settings['cutoff']
+            dataset.calculate_by_fit()
+        report(fit)
+    else:
+        for dataset in data_collection:
+            dataset.spin_system = spin_system
+            dataset.integration_grid = integration_grid
+            dataset.cutoff = 0
+            dataset.calculate_given()
+    for dataset in data_collection:
+        dataset.write_file()
+    express_duration(start_time)
